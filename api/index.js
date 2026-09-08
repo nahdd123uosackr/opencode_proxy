@@ -504,6 +504,18 @@ const handle = async (req, res) => {
     return res.end(JSON.stringify({ status: 'ok', upstream: UPSTREAM }));
   }
 
+  if (pathname === '/ip' || pathname === '/v1/ip') {
+    try {
+      const r = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) });
+      const d = await r.json();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ egress_ip: d.ip, provider: process.env.VERCEL ? 'vercel' : (process.env.DENO_REGION ? 'deno' : 'serverless') }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
+  }
+
   if (pathname.startsWith('/v1/') && !authOk(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid API key' } }));

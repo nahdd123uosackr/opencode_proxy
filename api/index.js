@@ -493,7 +493,7 @@ const MUSE_EFFORT = {
   max: 'high'
 };
 
-module.exports = async (req, res) => {
+const handle = async (req, res) => {
   for (const [k, v] of Object.entries(corsHeaders())) res.setHeader(k, v);
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, `https://${req.headers.host}`);
@@ -846,4 +846,72 @@ module.exports = async (req, res) => {
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `Route ${req.method} ${pathname} not found` } }));
+};
+
+// === Netlify / AWS Lambda Handler Adapter ===
+module.exports = handle;
+module.exports.default = handle;
+module.exports.handler = async function(event, context) {
+  const http = require('http');
+  const { EventEmitter } = require('events');
+
+  // Netlify event -> Node req 어댑터
+  const req = new EventEmitter();
+  req.method = event.httpMethod || 'GET';
+  const rawPath = event.rawUrl ? new URL(event.rawUrl).pathname : (event.path || '/');
+  const qs = event.rawQuery ? `?${event.rawQuery}` : '';
+  req.url = rawPath + qs;
+  req.headers = Object.fromEntries(
+    Object.entries(event.headers || {}).map(([k, v]) => [k.toLowerCase(), v])
+  );
+
+  return new Promise(resolve => {
+    let resHeaders = {};
+    let statusCode = 200;
+    const bodyChunks = [];
+
+    // Node res 어댑터
+    const res = {
+      headersSent: false,
+      writeHead(code, headers = {}) {
+        statusCode = code;
+        resHeaders = { ...resHeaders, ...headers };
+        this.headersSent = true;
+      },
+      setHeader(name, val) {
+        resHeaders[name.toLowerCase()] = val;
+      },
+      getHeader(name) {
+        return resHeaders[name.toLowerCase()];
+      },
+      write(chunk) {
+        if (chunk) bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      },
+      end(chunk) {
+        if (chunk) bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const finalBody = Buffer.concat(bodyChunks).toString('utf-8');
+        resolve({
+          statusCode: statusCode,
+          headers: resHeaders,
+          body: finalBody
+        });
+      }
+    };
+
+    // 핸들러 실행
+    Promise.resolve(handle(req, res)).catch(err => {
+      resolve({
+        statusCode: 502,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ error: { message: err.message } })
+      });
+    });
+
+    // body 주입
+    if (event.body) {
+      const payload = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body);
+      req.emit('data', payload);
+    }
+    req.emit('end');
+  });
 };

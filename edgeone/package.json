@@ -1,0 +1,6 @@
+{
+  "name": "opencode-proxy-edgeone",
+  "version": "1.0.0",
+  "description": "OpenCode Proxy for EdgeOne Edge Functions",
+  "main": "edge-functions/index.js"
+}

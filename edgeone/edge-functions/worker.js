@@ -1,4 +1,4 @@
-export const handleRequest = async 'use strict';
+'use strict';
 
 const UPSTREAM = 'https://opencode.ai/zen/v1';
 const PROXY_API_KEY = ''; // set via wrangler secret PROXY_API_KEY if needed
@@ -180,4 +180,3 @@ export default {
     return json({ error: { message: `Not found: ${request.method} ${pathname}` } }, 404);
   }
 };
-export { handleRequest };

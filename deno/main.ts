@@ -299,7 +299,15 @@ export default {
         const kHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
         const clientAuth = request.headers.get('authorization');
         if (clientAuth) kHeaders.Authorization = clientAuth;
-        const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: kHeaders, body: JSON.stringify({ ...body, model: realModel, messages: msgs }) });
+        // P17 fix (2026-09-11): drop the legacy reasoning_effort scalar when the
+        // structured reasoning.effort is also present -- Kilo's backend rejects
+        // both being set (mirrors the /v1/messages kilo branch below, which
+        // already stripped these).
+        const kiloBody = { ...body, model: realModel, messages: msgs };
+        if (kiloBody.reasoning && typeof kiloBody.reasoning === 'object' && kiloBody.reasoning.effort !== undefined && kiloBody.reasoning_effort !== undefined) {
+          delete kiloBody.reasoning_effort;
+        }
+        const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: kHeaders, body: JSON.stringify(kiloBody) });
         if (isStream && kr.ok) {
           return new Response(kr.body, { status: 200, headers: { ...CORS, 'Content-Type': kr.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' } });
         }

@@ -194,6 +194,25 @@ function applyMuseDefaults(body, api) {
   return body;
 }
 
+// P14 fix (2026-09-10): a role:'user' message whose content is ALREADY an
+// array (Chat Completions shape, e.g. Codex CLI's AGENTS.md injection --
+// [{type:'text', text:'...'}]) was forwarded verbatim with no per-part type
+// mapping. The Responses API input schema requires 'input_text' (not
+// 'text') for a user/input content part, so this produced
+// `input[N].content did not match any supported type` -- same bug class as
+// P9 (assistant output_text / top-level function_call), just on the user
+// side.
+function normalizeMuseContentPart(x) {
+  if (typeof x === 'string') return { type: 'input_text', text: x };
+  if (x && typeof x === 'object') {
+    if (x.type === 'text') return { type: 'input_text', text: x.text || '' };
+    if (x.type === 'image_url') {
+      const url = (x.image_url && x.image_url.url) || x.image_url;
+      return { type: 'input_image', image_url: url };
+    }
+  }
+  return x;
+}
 function museToInput(messages) {
   const input = [];
   const seenCalls = new Set();   // P3 fix (2026-08-25): 중복 function_call 제거
@@ -202,7 +221,9 @@ function museToInput(messages) {
     if (m.role === 'system' || m.role === 'developer') {
       input.push({ role: 'developer', content: [{ type: 'input_text', text: String(m.content) }] });
     } else if (m.role === 'user') {
-      const c = Array.isArray(m.content) ? m.content : [{ type: 'input_text', text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '') }];
+      const c = Array.isArray(m.content)
+        ? m.content.map(normalizeMuseContentPart)
+        : [{ type: 'input_text', text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '') }];
       input.push({ role: 'user', content: c });
     } else if (m.role === 'assistant') {
       // P9 fix (2026-09-09): function_call/function_call_output must be top-level

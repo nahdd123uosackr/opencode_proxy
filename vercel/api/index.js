@@ -622,6 +622,23 @@ const handle = async (req, res) => {
       if (!msgs.length && Array.isArray(body.input)) {
         msgs = body.input.map(i => ({ role: i.role || 'user', content: typeof i.content === 'string' ? i.content : Array.isArray(i.content) ? i.content.map(c => c.text || '').join('') : '' }));
       }
+      // P17 fix (2026-09-11): bifrost's own OpenAI-compatible dispatch layer
+      // (embedded @maximhq/bifrost, no source access) sometimes forwards BOTH
+      // the legacy scalar `reasoning_effort` AND the structured `reasoning:
+      // {effort}` object for the same request. Kilo's real backend rejects
+      // that outright: "reasoning_effort" and "reasoning.effort" are both
+      // provided with conflicting values. This proxy used to spread the
+      // incoming body straight through to Kilo unmodified, so the duplicate
+      // survived. Prefer the structured `reasoning.effort` (the modern,
+      // more specific field) and drop the legacy scalar when both are present.
+      if (
+        body.reasoning &&
+        typeof body.reasoning === 'object' &&
+        body.reasoning.effort !== undefined &&
+        body.reasoning_effort !== undefined
+      ) {
+        delete body.reasoning_effort;
+      }
       const kHeaders = { 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' };
       if (isKilo) {
         kHeaders['Authorization'] = `Bearer ${clientKey}`;

@@ -205,22 +205,26 @@ function museToInput(messages) {
       const c = Array.isArray(m.content) ? m.content : [{ type: 'input_text', text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '') }];
       input.push({ role: 'user', content: c });
     } else if (m.role === 'assistant') {
-      const parts = [];
-      if (m.content) parts.push({ type: 'text', text: String(m.content) });
+      // P9 fix (2026-09-09): function_call/function_call_output must be top-level
+      // input items, NOT nested inside a message's content array — the Responses
+      // API schema rejects {role:'assistant', content:[{type:'function_call',...}]}
+      // with "input[N].content did not match any supported type" once real
+      // tool-call history is replayed (missed by earlier single-turn-only tests).
+      // Also: assistant text parts must use type 'output_text', not 'text'.
+      if (m.content) input.push({ role: 'assistant', content: [{ type: 'output_text', text: String(m.content) }] });
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
           const callId = tc.id || '';
           if (callId && seenCalls.has(callId)) continue;
           if (callId) seenCalls.add(callId);
-          parts.push({ type: 'function_call', call_id: callId, name: tc.function?.name || '', arguments: typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments || {}) });
+          input.push({ type: 'function_call', call_id: callId, name: tc.function?.name || '', arguments: typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments || {}) });
         }
       }
-      if (parts.length) input.push({ role: 'assistant', content: parts });
     } else if (m.role === 'tool') {
       const outputId = m.tool_call_id || '';
       if (outputId && seenOutputs.has(outputId)) continue;
       if (outputId) seenOutputs.add(outputId);
-      input.push({ role: 'user', content: [{ type: 'function_call_output', call_id: outputId, output: String(m.content ?? '') }] });
+      input.push({ type: 'function_call_output', call_id: outputId, output: String(m.content ?? '') });
     }
   }
   return input;
@@ -268,17 +272,17 @@ function responsesToChatJson(r, model) {
   };
 }
 
-function chatChunk(deltaObj) { return 'data: ' + JSON.stringify({ id: 'chatcmpl-muse', object: 'chat.completion.chunk', choices: [{ index: 0, delta: deltaObj }] }) + '\\n\\n'; }
+function chatChunk(deltaObj) { return 'data: ' + JSON.stringify({ id: 'chatcmpl-muse', object: 'chat.completion.chunk', choices: [{ index: 0, delta: deltaObj }] }) + '\n\n'; }
 
 async function pumpResponsesSSEToChat(body, write) {
   const dec = new TextDecoder(); let buf = ''; let fnIndex = -1;
   for await (const chunk of body) {
     buf += dec.decode(chunk, { stream: true });
     let idx;
-    while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
       const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
       let data = null;
-      for (const line of raw.split('\\n')) { if (line.startsWith('data:')) data = line.slice(5).trim(); }
+      for (const line of raw.split('\n')) { if (line.startsWith('data:')) data = line.slice(5).trim(); }
       if (!data || data === '[DONE]') continue;
       let ev; try { ev = JSON.parse(data); } catch { continue; }
       const t = ev.type || '';
@@ -290,12 +294,12 @@ async function pumpResponsesSSEToChat(body, write) {
       else if (t === 'response.function_call_arguments.delta' && ev.delta) write(chatChunk({ tool_calls: [{ index: Math.max(fnIndex, 0), function: { arguments: ev.delta } }] }));
     }
   }
-  write('data: [DONE]\\n\\n');
+  write('data: [DONE]\n\n');
 }
 
 // === /v1/messages 스트리밍용 Anthropic 이벤트 변환 ===
 function createAnthropicStreamWriter(write, model, inputTokens) {
-  const w = (ev, obj) => write(`event: ${ev}\\ndata: ${JSON.stringify(obj)}\\n\\n`);
+  const w = (ev, obj) => write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
   let started = false, blockIdx = -1, blockKind = null, outTokens = 0;
   let curToolId = null, curToolName = null;
   const api = {
@@ -350,10 +354,10 @@ async function pumpChatSSEToAnthropic(body, aw) {
   for await (const chunk of body) {
     buf += dec.decode(chunk, { stream: true });
     let idx;
-    while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
       const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
       let data = null;
-      for (const line of raw.split('\\n')) { if (line.startsWith('data:')) data = line.slice(5).trim(); }
+      for (const line of raw.split('\n')) { if (line.startsWith('data:')) data = line.slice(5).trim(); }
       if (!data || data === '[DONE]') continue;
       let ev; try { ev = JSON.parse(data); } catch { continue; }
       const ch = (ev.choices && ev.choices[0]) || {};
@@ -377,7 +381,7 @@ async function pumpResponsesSSEToAnthropic(body, aw) {
   for await (const chunk of body) {
     buf += dec.decode(chunk, { stream: true });
     let idx;
-    while ((idx = buf.indexOf('\\n')) >= 0) {
+    while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx).trim();
       buf = buf.slice(idx + 1);
       if (!line.startsWith('data:') || !line.slice(5).trim() || line.includes('[DONE]')) continue;

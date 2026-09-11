@@ -527,10 +527,21 @@ export default {
 
       if (pathname === '/v1/responses') {
         if (/^kilo\//i.test(String(body.model || ''))) return json({ error: { message: 'kilo models do not support the Responses API. Use /v1/chat/completions.' } }, 400);
+        // P23 fix: flat reasoning_effort fallback, but avoid duplicate when body already has reasoning object
+        // Use rawVariant (colon suffix only) — global variant already includes thinking/clientBody and would bypass the body.reasoning check
+        const effectiveVariant = rawVariant || (body.reasoning ? null : effortFromClientBody(body));
         let upstreamBody = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
-        if (isMuse) upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
-        if (!isMuse) upstreamBody = applyVariant(upstreamBody, variant);
-        else if (variant) upstreamBody.reasoning = Object.assign({}, upstreamBody.reasoning, { effort: variant === 'minimal' ? 'low' : (['low', 'medium', 'high'].includes(variant) ? variant : 'high'), summary: (upstreamBody.reasoning || {}).summary || 'auto' });
+        if (isMuse) {
+          upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
+          if (effectiveVariant) {
+            delete upstreamBody.reasoning_effort; delete upstreamBody.reasoningEffort;
+            upstreamBody.reasoning = Object.assign({}, upstreamBody.reasoning, { effort: effectiveVariant === 'minimal' ? 'low' : (['low', 'medium', 'high'].includes(effectiveVariant) ? effectiveVariant : 'high'), summary: (upstreamBody.reasoning || {}).summary || 'auto' });
+          } else if (upstreamBody.reasoning) {
+            delete upstreamBody.reasoning_effort; delete upstreamBody.reasoningEffort;
+          }
+        } else {
+          upstreamBody = applyVariant(upstreamBody, effectiveVariant);
+        }
         if (Array.isArray(upstreamBody.input)) upstreamBody.input = sanitizeResponsesInput(upstreamBody.input);
         const r = await forward('/responses', upstreamBody, isStream);
         return forwardStreamOrJson(r, isStream);

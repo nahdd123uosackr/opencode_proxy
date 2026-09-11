@@ -1131,7 +1131,12 @@ const handle = async (req, res) => {
     let upstreamBody = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) {
       upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
-      if (effectiveVariant) upstreamBody.reasoning = { effort: MUSE_EFFORT[effectiveVariant] || 'high', summary: 'auto' };
+      if (effectiveVariant) {
+        delete upstreamBody.reasoning_effort; delete upstreamBody.reasoningEffort;
+        upstreamBody.reasoning = { effort: MUSE_EFFORT[effectiveVariant] || 'high', summary: 'auto' };
+      } else if (upstreamBody.reasoning) {
+        delete upstreamBody.reasoning_effort; delete upstreamBody.reasoningEffort;
+      }
     } else {
       upstreamBody = applyVariant(upstreamBody, effectiveVariant);
     }

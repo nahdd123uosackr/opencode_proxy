@@ -299,14 +299,16 @@ export default {
         const kHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
         const clientAuth = request.headers.get('authorization');
         if (clientAuth) kHeaders.Authorization = clientAuth;
-        // P17 fix (2026-09-11): drop the legacy reasoning_effort scalar when the
-        // structured reasoning.effort is also present -- Kilo's backend rejects
-        // both being set (mirrors the /v1/messages kilo branch below, which
-        // already stripped these).
+        // P17 fix (2026-09-11, corrected): live diagnostic logging on oracle2
+        // showed the real failing requests carry ONLY reasoning_effort --
+        // reasoning (the structured object) is absent entirely. So this is
+        // Kilo's own backend assigning its own internal reasoning.effort for
+        // whatever model kilo-auto routes to, conflicting with the client's
+        // reasoning_effort -- not a client-side duplicate. Unconditionally
+        // strip both spellings, matching the /v1/messages kilo branch below.
         const kiloBody = { ...body, model: realModel, messages: msgs };
-        if (kiloBody.reasoning && typeof kiloBody.reasoning === 'object' && kiloBody.reasoning.effort !== undefined && kiloBody.reasoning_effort !== undefined) {
-          delete kiloBody.reasoning_effort;
-        }
+        delete kiloBody.reasoning_effort;
+        delete kiloBody.reasoningEffort;
         const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: kHeaders, body: JSON.stringify(kiloBody) });
         if (isStream && kr.ok) {
           return new Response(kr.body, { status: 200, headers: { ...CORS, 'Content-Type': kr.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' } });

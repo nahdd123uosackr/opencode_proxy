@@ -720,6 +720,31 @@ const MUSE_EFFORT = {
   max: 'high'
 };
 
+// P23 fix (2026-09-11): muse-spark 경로(museViaResponses)와 /v1/messages는 effort를
+// 오직 모델명 콜론 접미사(":high" 등)의 `variant`로만 읽었다. 클라이언트가 실제로
+// 보낸 reasoning_effort / reasoning.effort(Codex의 /v1/chat/completions 호출 등)는
+// 완전히 무시되고 콜론 접미사가 없으면 무조건 'low'로 깔렸다. 콜론 접미사가 없을 때
+// body 자체에 실려온 effort 힌트를 대신 사용한다 (콜론 접미사가 최우선, 그다음 body).
+function effortFromClientBody(body) {
+  if (typeof body.reasoning_effort === 'string' && body.reasoning_effort) return body.reasoning_effort;
+  if (typeof body.reasoningEffort === 'string' && body.reasoningEffort) return body.reasoningEffort;
+  if (body.reasoning && typeof body.reasoning.effort === 'string' && body.reasoning.effort) return body.reasoning.effort;
+  return null;
+}
+
+// Claude(Anthropic) 클라이언트의 extended thinking(`thinking: {type:"enabled",
+// budget_tokens:N}`)은 이 프록시가 요청 쪽에서 전혀 읽지 않고 있었다(응답 쪽 reasoning ->
+// thinking 블록 변환만 존재). budget_tokens를 muse의 3단계 effort로 대략 매핑한다 —
+// 정확한 토큰 대 effort 환산표가 없어 임의 경계지만, "thinking을 켰는데 완전히
+// 무시당하는 것"보다는 낫다.
+function effortFromThinking(thinking) {
+  if (!thinking || thinking.type !== 'enabled') return null;
+  const bt = Number(thinking.budget_tokens) || 0;
+  if (bt <= 4000) return 'low';
+  if (bt <= 12000) return 'medium';
+  return 'high';
+}
+
 const handle = async (req, res) => {
   for (const [k, v] of Object.entries(corsHeaders())) res.setHeader(k, v);
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
@@ -916,12 +941,15 @@ const handle = async (req, res) => {
         return res.end(JSON.stringify({ error: { message: `Zen Key is in cooldown (${cooling.reason}), retry in ${remainingSec}s`, type: 'rate_limit_exceeded' } }));
       }
     }
+    // P23: 콜론 접미사 없이 reasoning_effort/reasoning.effort로 effort를 보낸
+    // 클라이언트(OpenAI 호환 SDK 등)도 museViaResponses가 그 값을 쓰도록 한다.
+    const effectiveVariant = variant || effortFromClientBody(body);
     let ub = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) ub.metadata = Object.assign({}, ub.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
-    if (!/muse/i.test(upstreamModel)) ub = applyVariant(ub, variant);
+    if (!/muse/i.test(upstreamModel)) ub = applyVariant(ub, effectiveVariant);
 
-    const upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), variant);
-    if (variant && /muse/i.test(upstreamModel)) delete upstreamBody.reasoning_effort, upstreamBody.reasoning = { effort: variant === 'minimal' ? 'low' : variant };
+    const upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), effectiveVariant);
+    if (effectiveVariant && /muse/i.test(upstreamModel)) delete upstreamBody.reasoning_effort, upstreamBody.reasoning = { effort: MUSE_EFFORT[effectiveVariant] || 'high' };
 
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
     headers['Cache-Control'] = 'no-store';
@@ -929,7 +957,7 @@ const handle = async (req, res) => {
     try {
       let fetchRes;
       if (/muse/i.test(upstreamModel)) {
-        fetchRes = await museViaResponses(upstreamModel, upstreamBody, variant, !!body.stream, zenApiKey);
+        fetchRes = await museViaResponses(upstreamModel, upstreamBody, effectiveVariant, !!body.stream, zenApiKey);
         if (fetchRes.ok && body.stream) {
           if (zenApiKey) markKeySuccess(zenApiKey);
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
@@ -993,6 +1021,11 @@ const handle = async (req, res) => {
     
     const zenApiKey = isZen ? clientKey : null;
     const { upstreamModel, variant } = parseModel(body.model);
+    // P23: 콜론 접미사가 없으면 Claude의 thinking(budget_tokens) -> 그다음
+    // reasoning_effort/reasoning.effort 순서로 effort를 추정한다. 이전에는 콜론
+    // 접미사가 없으면 무조건 'low'로 깔려서 클라이언트가 요청한 thinking/effort가
+    // muse-spark 경로에서 통째로 무시됐다.
+    const effectiveVariant = variant || effortFromThinking(body.thinking) || effortFromClientBody(body);
     // P21: Anthropic → OpenAI 정규화 (system/tool/image/tool_result)
     const anthMessages = anthropicMessagesToOpenAI(body);
     const anthTools = anthropicToolsToOpenAI(body.tools);
@@ -1008,13 +1041,13 @@ const handle = async (req, res) => {
       ...(anthTools ? { tools: anthTools } : {}),
       ...(anthToolChoice ? { tool_choice: anthToolChoice } : {})
     };
-    openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), variant);
+    openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), effectiveVariant);
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
-    
+
     try {
       let fetchRes;
       if (/muse/i.test(upstreamModel)) {
-        const mfr = await museViaResponses(upstreamModel, openReq, variant, !!body.stream, zenApiKey);
+        const mfr = await museViaResponses(upstreamModel, openReq, effectiveVariant, !!body.stream, zenApiKey);
         if (!mfr.ok) { const t = await mfr.text(); res.writeHead(mfr.status, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: t.slice(0, 500) } })); }
         if (body.stream) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
@@ -1090,12 +1123,17 @@ const handle = async (req, res) => {
     
     const zenApiKey = isZen ? clientKey : null;
     const { upstreamModel, variant } = parseModel(body.model);
+    // P23: 네이티브 /v1/responses 호출은 보통 body.reasoning.effort를 이미 제대로
+    // 보내서(applyMuseDefaults의 `body.reasoning || {...}`가 보존) 대부분 문제없지만,
+    // 콜론 접미사도 없고 nested reasoning도 없이 flat reasoning_effort만 보내는
+    // 클라이언트를 위한 폴백.
+    const effectiveVariant = variant || (body.reasoning ? null : effortFromClientBody(body));
     let upstreamBody = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) {
       upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
-      if (variant) upstreamBody.reasoning = { effort: MUSE_EFFORT[variant] || 'high', summary: 'auto' };
+      if (effectiveVariant) upstreamBody.reasoning = { effort: MUSE_EFFORT[effectiveVariant] || 'high', summary: 'auto' };
     } else {
-      upstreamBody = applyVariant(upstreamBody, variant);
+      upstreamBody = applyVariant(upstreamBody, effectiveVariant);
     }
     // P20: /v1/responses passthrough 정규화 — Codex wire_api=responses 직접 호출 시
     // type:'text' 등이 그대로 가면 Zen이 input[N].content 400을 냄. skill.md §4 교훈.

@@ -330,6 +330,23 @@ function anthropicToolChoiceToOpenAI(tc) {
 
 const MUSE_EFFORT = { minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high' };
 
+// P23 fix (2026-09-11): 콜론 접미사(":high") 없이 클라이언트가 실제로 보낸
+// reasoning_effort/reasoning.effort/thinking을 muse 경로가 전부 무시하고 무조건
+// 'low'로 깔던 문제. api/index.js와 동일 로직 이식.
+function effortFromClientBody(body) {
+  if (typeof body.reasoning_effort === 'string' && body.reasoning_effort) return body.reasoning_effort;
+  if (typeof body.reasoningEffort === 'string' && body.reasoningEffort) return body.reasoningEffort;
+  if (body.reasoning && typeof body.reasoning.effort === 'string' && body.reasoning.effort) return body.reasoning.effort;
+  return null;
+}
+function effortFromThinking(thinking) {
+  if (!thinking || thinking.type !== 'enabled') return null;
+  const bt = Number(thinking.budget_tokens) || 0;
+  if (bt <= 4000) return 'low';
+  if (bt <= 12000) return 'medium';
+  return 'high';
+}
+
 function responsesToChatJson(json, model) {
   let text = ''; const toolCalls = [];
   for (const o of json.output || []) {
@@ -441,9 +458,11 @@ export default {
       }
     }
 
-    const { upstreamModel, variant } = parseModel(body.model);
+    const { upstreamModel, variant: rawVariant } = parseModel(body.model);
     const isMuse = /muse/i.test(upstreamModel);
     const isStream = !!body.stream;
+    // P23: 콜론 접미사가 최우선, 없으면 thinking -> reasoning_effort/reasoning.effort 순.
+    const variant = rawVariant || effortFromThinking(body.thinking) || effortFromClientBody(body);
 
     try {
       // === Kilo Gateway 모델 (kilo/ 접두사) — zen 로직 우회, 직접 포워드 ===

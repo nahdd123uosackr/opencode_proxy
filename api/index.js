@@ -202,16 +202,30 @@ function applyMuseDefaults(body, api) {
 // `input[N].content did not match any supported type` -- same bug class as
 // P9 (assistant output_text / top-level function_call), just on the user
 // side.
-function normalizeMuseContentPart(x) {
-  if (typeof x === 'string') return { type: 'input_text', text: x };
+// P20 fix (2026-09-11): Codex wire_api=responses 직접 호출 시 /v1/responses
+// 경로가 전혀 정규화 없이 passthrough되어 동일한 400이 재발함. 또한
+// system/developer가 배열형 AGENTS.md를 보낼 때 String()으로 망가지는
+// 케이스, assistant content가 배열일 때 String() 오염 케이스도 함께 수정.
+// 유의사항: 유의사항.md §정규식 "이중 이스케이프 금지", §muse 경로별 variant
+// 매핑 누락 주의 — MUSE_EFFORT 6키 유지.
+function normalizeMuseContentPart(x, role) {
+  // role: 'user' | 'developer' | 'assistant' — 출력 타입 결정에 사용
+  const targetRole = role === 'assistant' ? 'assistant' : 'user';
+  if (typeof x === 'string') return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: x };
   if (x && typeof x === 'object') {
-    if (x.type === 'text') return { type: 'input_text', text: x.text || '' };
+    if (x.type === 'text') return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: x.text || '' };
+    if (x.type === 'input_text' || x.type === 'output_text' || x.type === 'refusal') return x;
+    if (x.type === 'input_image' && x.image_url) return x;
     if (x.type === 'image_url') {
-      const url = (x.image_url && x.image_url.url) || x.image_url;
-      return { type: 'input_image', image_url: url };
+      const url = (x.image_url && x.image_url.url) || x.image_url || x.url;
+      if (url) return { type: 'input_image', image_url: url };
+      return null;
     }
+    // 지원 불가 타입은 텍스트가 있으면 텍스트로 퇴화, 없으면 드랍(400 방지)
+    if (typeof x.text === 'string' && x.text) return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: String(x.text) };
+    if (typeof x.content === 'string' && x.content) return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: String(x.content) };
   }
-  return x;
+  return null;
 }
 function museToInput(messages) {
   const input = [];
@@ -219,11 +233,27 @@ function museToInput(messages) {
   const seenOutputs = new Set(); // P3 fix (2026-08-25): 중복 function_call_output 제거 (zen 'Duplicate function_call_output' 400 방지)
   for (const m of messages || []) {
     if (m.role === 'system' || m.role === 'developer') {
-      input.push({ role: 'developer', content: [{ type: 'input_text', text: String(m.content) }] });
+      // P20: system/developer도 배열형 content 대응 (Codex AGENTS.md 등)
+      let c;
+      if (Array.isArray(m.content)) {
+        c = m.content.map(v => normalizeMuseContentPart(v, 'user')).filter(Boolean);
+        if (!c.length) c = [{ type: 'input_text', text: '' }];
+      } else if (typeof m.content === 'string') {
+        c = [{ type: 'input_text', text: m.content }];
+      } else {
+        c = [{ type: 'input_text', text: JSON.stringify(m.content ?? '') }];
+      }
+      input.push({ role: 'developer', content: c });
     } else if (m.role === 'user') {
-      const c = Array.isArray(m.content)
-        ? m.content.map(normalizeMuseContentPart)
-        : [{ type: 'input_text', text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '') }];
+      let c;
+      if (Array.isArray(m.content)) {
+        c = m.content.map(v => normalizeMuseContentPart(v, 'user')).filter(Boolean);
+        if (!c.length) c = [{ type: 'input_text', text: '' }];
+      } else if (typeof m.content === 'string') {
+        c = [{ type: 'input_text', text: m.content }];
+      } else {
+        c = [{ type: 'input_text', text: JSON.stringify(m.content ?? '') }];
+      }
       input.push({ role: 'user', content: c });
     } else if (m.role === 'assistant') {
       // P9 fix (2026-09-09): function_call/function_call_output must be top-level
@@ -232,7 +262,13 @@ function museToInput(messages) {
       // with "input[N].content did not match any supported type" once real
       // tool-call history is replayed (missed by earlier single-turn-only tests).
       // Also: assistant text parts must use type 'output_text', not 'text'.
-      if (m.content) input.push({ role: 'assistant', content: [{ type: 'output_text', text: String(m.content) }] });
+      // P20: 배열형 content 대응 — String() 오염 방지
+      if (Array.isArray(m.content)) {
+        const c = m.content.map(v => normalizeMuseContentPart(v, 'assistant')).filter(Boolean);
+        if (c.length) input.push({ role: 'assistant', content: c });
+      } else if (m.content) {
+        input.push({ role: 'assistant', content: [{ type: 'output_text', text: String(m.content) }] });
+      }
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
           const callId = tc.id || '';
@@ -249,6 +285,53 @@ function museToInput(messages) {
     }
   }
   return input;
+}
+
+// P20: Codex wire_api=responses 네이티브 input sanitizer — /v1/responses passthrough
+// 경로의 재발 방지. skill.md §4의 "museToInput 버그가 가장 많았다" 교훈 반영.
+function sanitizeResponsesInput(input) {
+  if (!Array.isArray(input)) return input;
+  const out = [];
+  for (const it of input) {
+    if (!it || typeof it !== 'object') continue;
+    // 1) role 기반 message — content 배열 정규화
+    if (it.role) {
+      const role = it.role;
+      let content = it.content;
+      if (typeof content === 'string') {
+        content = [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+      } else if (!Array.isArray(content)) {
+        // content가 null/object 등 비정상 — 문자열화 후 input_text로
+        content = content ? [{ type: 'input_text', text: JSON.stringify(content) }] : [{ type: 'input_text', text: '' }];
+      }
+      const norm = content.map(c => normalizeMuseContentPart(c, role)).filter(Boolean);
+      const finalContent = norm.length ? norm : [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: '' }];
+      out.push({ role, content: finalContent });
+      continue;
+    }
+    // 2) top-level function_call / function_call_output — 그대로 유지 (중복은 호출부에서 처리)
+    if (it.type === 'function_call' || it.type === 'function_call_output') {
+      out.push(it);
+      continue;
+    }
+    // 3) Codex가 간혹 {type:'message', role, content} 형태로 감싸는 케이스
+    if (it.type === 'message' && it.role) {
+      const role = it.role;
+      let content = it.content;
+      if (typeof content === 'string') content = [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+      if (!Array.isArray(content)) content = [{ type: 'input_text', text: String(content ?? '') }];
+      const norm = content.map(c => normalizeMuseContentPart(c, role)).filter(Boolean);
+      out.push({ role, content: norm.length ? norm : [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: '' }] });
+      continue;
+    }
+    // 4) reasoning / 기타 확장 타입 — Zen이 아직 지원 안 하면 드랍하되 로그 남김 (400보다 낫다)
+    if (it.type === 'reasoning' || it.type === 'custom_tool_call' || it.type === 'compaction' || it.type === 'item_reference') {
+      console.warn('[sanitize] drop unsupported input item type=' + it.type);
+      continue;
+    }
+    console.warn('[sanitize] drop unknown input item ' + JSON.stringify(it).slice(0, 160));
+  }
+  return out;
 }
 
 function responsesToChatJson(r, model) {
@@ -880,6 +963,12 @@ const handle = async (req, res) => {
       if (variant) upstreamBody.reasoning = { effort: MUSE_EFFORT[variant] || 'high', summary: 'auto' };
     } else {
       upstreamBody = applyVariant(upstreamBody, variant);
+    }
+    // P20: /v1/responses passthrough 정규화 — Codex wire_api=responses 직접 호출 시
+    // type:'text' 등이 그대로 가면 Zen이 input[N].content 400을 냄. skill.md §4 교훈.
+    if (Array.isArray(upstreamBody.input)) upstreamBody.input = sanitizeResponsesInput(upstreamBody.input);
+    if (Array.isArray(upstreamBody.instructions) && typeof upstreamBody.instructions === 'string') {
+      // instructions는 문자열 그대로 유지 — 배열이면 이미 input으로 처리됨
     }
 
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);

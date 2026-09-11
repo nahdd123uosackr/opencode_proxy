@@ -128,16 +128,25 @@ function applyVariant(upstreamBody, variant) {
 // injection) passed through untouched, and the Responses API input schema
 // rejects 'text' as a user/input part type with
 // `input[N].content did not match any supported type`.
-function normalizeMuseContentPart(x) {
-  if (typeof x === 'string') return { type: 'input_text', text: x };
+// P20 fix (2026-09-11): Codex wire_api=responses 직접 호출 시 /v1/responses
+// passthrough 미정규화 + system/developer 배열형 AGENTS.md String 오염 +
+// assistant 배열형 content 오염 함께 수정.
+function normalizeMuseContentPart(x, role) {
+  const targetRole = role === 'assistant' ? 'assistant' : 'user';
+  if (typeof x === 'string') return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: x };
   if (x && typeof x === 'object') {
-    if (x.type === 'text') return { type: 'input_text', text: x.text || '' };
+    if (x.type === 'text') return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: x.text || '' };
+    if (x.type === 'input_text' || x.type === 'output_text' || x.type === 'refusal') return x;
+    if (x.type === 'input_image' && x.image_url) return x;
     if (x.type === 'image_url') {
-      const url = (x.image_url && x.image_url.url) || x.image_url;
-      return { type: 'input_image', image_url: url };
+      const url = (x.image_url && x.image_url.url) || x.image_url || x.url;
+      if (url) return { type: 'input_image', image_url: url };
+      return null;
     }
+    if (typeof x.text === 'string' && x.text) return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: String(x.text) };
+    if (typeof x.content === 'string' && x.content) return { type: targetRole === 'assistant' ? 'output_text' : 'input_text', text: String(x.content) };
   }
-  return x;
+  return null;
 }
 function museToInput(messages) {
   const input = [];
@@ -145,11 +154,36 @@ function museToInput(messages) {
   const seenOutputs = new Set(); // P3 fix: duplicate function_call_output guard
   for (const m of messages || []) {
     if (m.role === 'system' || m.role === 'developer') {
-      input.push({ role: 'developer', content: [{ type: 'input_text', text: String(m.content) }] });
+      let c;
+      if (Array.isArray(m.content)) {
+        c = m.content.map(v => normalizeMuseContentPart(v, 'user')).filter(Boolean);
+        if (!c.length) c = [{ type: 'input_text', text: '' }];
+      } else if (typeof m.content === 'string') {
+        c = [{ type: 'input_text', text: m.content }];
+      } else {
+        c = [{ type: 'input_text', text: JSON.stringify(m.content ?? '') }];
+      }
+      input.push({ role: 'developer', content: c });
     } else if (m.role === 'user') {
-      const c = Array.isArray(m.content) ? m.content : [{ type: 'input_text', text: String(m.content ?? '') }];
-      input.push({ role: 'user', content: c.map(normalizeMuseContentPart) });
+      let c;
+      if (Array.isArray(m.content)) {
+        c = m.content.map(v => normalizeMuseContentPart(v, 'user')).filter(Boolean);
+        if (!c.length) c = [{ type: 'input_text', text: '' }];
+      } else if (typeof m.content === 'string') {
+        c = [{ type: 'input_text', text: m.content }];
+      } else {
+        c = [{ type: 'input_text', text: JSON.stringify(m.content ?? '') }];
+      }
+      input.push({ role: 'user', content: c });
     } else if (m.role === 'assistant') {
+      if (Array.isArray(m.content)) {
+        const c = m.content.map(v => normalizeMuseContentPart(v, 'assistant')).filter(Boolean);
+        if (c.length) input.push({ role: 'assistant', content: c });
+      } else if (m.content) {
+        input.push({ role: 'assistant', content: [{ type: 'output_text', text: String(m.content) }] });
+      } else if (!m.tool_calls) {
+        input.push({ role: 'assistant', content: [{ type: 'output_text', text: '' }] });
+      }
       if (m.tool_calls) {
         for (const tc of m.tool_calls) {
           if (tc.id) { if (seenCalls.has(tc.id)) continue; seenCalls.add(tc.id); }
@@ -157,9 +191,6 @@ function museToInput(messages) {
           try { JSON.parse(args); } catch { args = '{}'; }
           input.push({ type: 'function_call', name: tc.function.name, call_id: tc.id, arguments: String(args) });
         }
-        if (m.content) input.push({ role: 'assistant', content: [{ type: 'output_text', text: m.content }] });
-      } else {
-        input.push({ role: 'assistant', content: [{ type: 'output_text', text: m.content || '' }] });
       }
     } else if (m.role === 'tool') {
       const oid0 = m.tool_call_id ?? '';
@@ -169,6 +200,40 @@ function museToInput(messages) {
     }
   }
   return input;
+}
+
+function sanitizeResponsesInput(input) {
+  if (!Array.isArray(input)) return input;
+  const out = [];
+  for (const it of input) {
+    if (!it || typeof it !== 'object') continue;
+    if (it.role) {
+      const role = it.role;
+      let content = it.content;
+      if (typeof content === 'string') content = [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+      else if (!Array.isArray(content)) content = content ? [{ type: 'input_text', text: JSON.stringify(content) }] : [{ type: 'input_text', text: '' }];
+      const norm = content.map(c => normalizeMuseContentPart(c, role)).filter(Boolean);
+      const finalContent = norm.length ? norm : [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: '' }];
+      out.push({ role, content: finalContent });
+      continue;
+    }
+    if (it.type === 'function_call' || it.type === 'function_call_output') { out.push(it); continue; }
+    if (it.type === 'message' && it.role) {
+      const role = it.role;
+      let content = it.content;
+      if (typeof content === 'string') content = [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: content }];
+      if (!Array.isArray(content)) content = [{ type: 'input_text', text: String(content ?? '') }];
+      const norm = content.map(c => normalizeMuseContentPart(c, role)).filter(Boolean);
+      out.push({ role, content: norm.length ? norm : [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: '' }] });
+      continue;
+    }
+    if (it.type === 'reasoning' || it.type === 'custom_tool_call' || it.type === 'compaction' || it.type === 'item_reference') {
+      console.warn('[sanitize] drop unsupported input item type=' + it.type);
+      continue;
+    }
+    console.warn('[sanitize] drop unknown input item ' + JSON.stringify(it).slice(0, 160));
+  }
+  return out;
 }
 
 const MUSE_EFFORT = { minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high' };
@@ -355,6 +420,7 @@ export default {
         if (isMuse) upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
         if (!isMuse) upstreamBody = applyVariant(upstreamBody, variant);
         else if (variant) upstreamBody.reasoning = Object.assign({}, upstreamBody.reasoning, { effort: variant === 'minimal' ? 'low' : (['low', 'medium', 'high'].includes(variant) ? variant : 'high'), summary: (upstreamBody.reasoning || {}).summary || 'auto' });
+        if (Array.isArray(upstreamBody.input)) upstreamBody.input = sanitizeResponsesInput(upstreamBody.input);
         const r = await forward('/responses', upstreamBody, isStream);
         return forwardStreamOrJson(r, isStream);
       }

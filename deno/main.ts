@@ -406,6 +406,16 @@ function truncateInputIfNeeded(input, instructions, maxTokens) {
   console.log(`[truncate] input ${input.length}→${truncated.length} tokens ${total}→${keptTokens} (max ${MAX})`);
   return truncated;
 }
+function truncateAnthropicBodyIfNeeded(body) {
+  const MAX = parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  const sysTokens = estimateTokens(JSON.stringify(body.system || ''));
+  const msgTokens = totalPromptTokensForMessages(body.messages || [], null);
+  const total = sysTokens + msgTokens;
+  if (total <= MAX) return body;
+  const truncatedMessages = truncateMessagesIfNeeded(body.messages || [], body.system, MAX - sysTokens - 100);
+  console.log(`[truncate] anthropic messages ${body.messages.length}→${truncatedMessages.length} tokens ${total}→${sysTokens + totalPromptTokensForMessages(truncatedMessages, null)} (max ${MAX})`);
+  return { ...body, messages: truncatedMessages };
+}
 
 function effortFromThinking(thinking) {
   if (!thinking || thinking.type !== 'enabled') return null;
@@ -619,49 +629,59 @@ export default {
       }
 
       if (pathname === '/v1/messages') {
-        let anthMessages = anthropicMessagesToOpenAI(body);
-        anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
-        const anthTools = anthropicToolsToOpenAI(body.tools);
-        const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
-        const openReq = { model: upstreamModel, messages: anthMessages, max_tokens: body.max_tokens, temperature: body.temperature, top_p: body.top_p, stream: !!body.stream, stop: body.stop_sequences, ...(anthTools?{tools:anthTools}:{}), ...(anthToolChoice?{tool_choice:anthToolChoice}:{}) };
-        const full = applyVariant(applyMuseDefaults(openReq, 'chat'), variant);
-        if (variant && isMuse) full.reasoning = { effort: variant === 'minimal' ? 'low' : (['low', 'medium', 'high'].includes(variant) ? variant : 'high') };
-        let r;
-        if (/^kilo\//i.test(String(full.model || ''))) {
-          const kBody = { ...full, model: String(full.model).replace(/^kilo\//i, '') };
-          delete kBody.reasoning_effort; delete kBody.reasoningEffort;
-          if (variant && !String(kBody.model).includes(':')) kBody.model += ':' + variant;
-          const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: injectHeaders({ 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' }), body: JSON.stringify(kBody) });
-          r = new Response(await kr.text(), { status: kr.status, headers: { 'Content-Type': kr.headers.get('content-type') || 'application/json' } });
-        } else if (isMuse) {
-          // P21-fix (2026-09-11): muse-spark는 /chat/completions를 지원하지 않아
-          // (P9 등, upstream이 빈 응답/500을 반환) /responses로 우회해야 한다.
-          // api/index.js는 이 분기가 있었는데 deno 포팅 시 누락돼 muse 모델 +
-          // /v1/messages 조합이 전부 500(Internal server error)으로 깨졌었다.
-          // museChatResponse가 이미 /responses 왕복 + OpenAI chat.completion(.chunk)
-          // 형태 변환을 다 처리하므로 그대로 재사용 — 아래 공통 경로(SSE 그대로
-          // 포워드 / JSON 파싱 후 Anthropic 변환)가 동일하게 적용된다.
-          r = await museChatResponse(upstreamModel, full, variant, isStream);
-        } else {
-          r = await forward('/chat/completions', full, isStream);
+        // zen 네이티브 직통 — 이중 변환 제거, P21/P23 간소화
+        // 대형 프롬프트 트렁케이트
+        if (body.messages || body.system) {
+          const tmp = truncateAnthropicBodyIfNeeded(body);
+          body.messages = tmp.messages;
+          body.system = tmp.system;
         }
-        if (isStream) return forwardStreamOrJson(r, true);
-        const text = await r.text();
-        if (!r.ok) return json({ type: 'error', error: { type: 'api_error', message: text.slice(0, 500) } }, r.status);
-        let openJson; try { openJson = JSON.parse(text); } catch (e) { return json({ type: 'error', error: { type: 'api_error', message: 'invalid upstream json' } }, 502); }
-        const choice = openJson.choices?.[0];
-        const msg = choice?.message || {};
-        const contentBlocks = [];
-        if (msg.content) contentBlocks.push({ type: 'text', text: msg.content });
-        const anthRes = {
-          id: openJson.id?.replace('gen-', 'msg_') || `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
-          type: 'message', role: 'assistant', model: openJson.model || upstreamModel,
-          content: contentBlocks.length ? contentBlocks : [{ type: 'text', text: '' }],
-          stop_reason: choice?.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn', stop_sequence: null,
-          usage: { input_tokens: openJson.usage?.prompt_tokens || 0, output_tokens: openJson.usage?.completion_tokens || 0 }
-        };
-        return json(anthRes);
+        const isKiloM = /^kilo\//i.test(String(body.model || '')) || /^kilo\//i.test(String(upstreamModel || ''));
+        if (isKiloM) {
+          let anthMessages = anthropicMessagesToOpenAI(body);
+          anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
+          const anthTools = anthropicToolsToOpenAI(body.tools);
+          const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
+          const openReq = { model: upstreamModel, messages: anthMessages, max_tokens: body.max_tokens, temperature: body.temperature, top_p: body.top_p, stream: !!body.stream, stop: body.stop_sequences, ...(anthTools?{tools:anthTools}:{}), ...(anthToolChoice?{tool_choice:anthToolChoice}:{}) };
+          const full = applyVariant(applyMuseDefaults(openReq, 'chat'), variant);
+          if (variant && isMuse) full.reasoning = { effort: variant === 'minimal' ? 'low' : (['low', 'medium', 'high'].includes(variant) ? variant : 'high') };
+          let r;
+          if (/^kilo\//i.test(String(full.model || ''))) {
+            const kBody = { ...full, model: String(full.model).replace(/^kilo\//i, '') };
+            delete kBody.reasoning_effort; delete kBody.reasoningEffort;
+            if (variant && !String(kBody.model).includes(':')) kBody.model += ':' + variant;
+            const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: injectHeaders({ 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' }), body: JSON.stringify(kBody) });
+            r = new Response(await kr.text(), { status: kr.status, headers: { 'Content-Type': kr.headers.get('content-type') || 'application/json' } });
+          } else if (isMuse) {
+            r = await museChatResponse(upstreamModel, full, variant, isStream);
+          } else {
+            r = await forward('/chat/completions', full, isStream);
+          }
+          if (isStream) return forwardStreamOrJson(r, true);
+          const text = await r.text();
+          if (!r.ok) return json({ type: 'error', error: { type: 'api_error', message: text.slice(0, 500) } }, r.status);
+          let openJson; try { openJson = JSON.parse(text); } catch (e) { return json({ type: 'error', error: { type: 'api_error', message: 'invalid upstream json' } }, 502); }
+          const choice = openJson.choices?.[0];
+          const msg = choice?.message || {};
+          const contentBlocks = [];
+          if (msg.content) contentBlocks.push({ type: 'text', text: msg.content });
+          const anthRes = {
+            id: openJson.id?.replace('gen-','msg_') || `msg_${crypto.randomUUID().replace(/-/g,'').slice(0,24)}`,
+            type: 'message', role: 'assistant', model: openJson.model || upstreamModel,
+            content: contentBlocks.length ? contentBlocks : [{ type: 'text', text: '' }],
+            stop_reason: choice?.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn', stop_sequence: null,
+            usage: { input_tokens: openJson.usage?.prompt_tokens || 0, output_tokens: openJson.usage?.completion_tokens || 0 }
+          };
+          return json(anthRes);
+        }
+        // zen 직통
+        const headersM = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+        const frM = await fetch(UPSTREAM + '/messages', { method: 'POST', headers: headersM, body: JSON.stringify(body), signal: AbortSignal.timeout(20000) });
+        if (isStream && frM.ok) return new Response(frM.body, { status: frM.status, headers: { ...CORS, 'Content-Type': frM.headers.get('content-type') || 'text/event-stream' } });
+        const tM = await frM.text();
+        return new Response(tM, { status: frM.status, headers: { ...CORS, 'Content-Type': frM.headers.get('content-type') || 'application/json' } });
       }
+
     } catch (e) {
       return json({ error: { message: e.message } }, 502);
     }

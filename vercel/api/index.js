@@ -1318,6 +1318,13 @@ const handle = async (req, res) => {
     const zenApiKey = isZen ? clientKey : null;
     const isStream = !!body.stream;
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    // zen의 /v1/messages는 진짜 Anthropic Messages API 계약을 따라서 Authorization: Bearer가
+    // 아니라 x-api-key를 요구한다 (chat/completions, /responses는 Bearer로 정상 동작 확인됨 —
+    // mes 전용 케이스). CLIProxyAPI의 claude-api-key 실행기 경유 검증 중 발견 (AuthError: Missing API key).
+    if (pathname === '/mes/v1/messages' && zenApiKey) {
+      headers['x-api-key'] = zenApiKey;
+      delete headers['Authorization'];
+    }
     try {
       const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: rawBody, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       const ct = fr.headers.get('content-type') || 'application/json';

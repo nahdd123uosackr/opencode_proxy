@@ -145,6 +145,22 @@ state" 에러를 낸 사례) — 이 경우도 재시작 한 번 더 하면 쿨�
 직접 쿨다운을 지우려면 `remote-management.secret-key`의 평문 비밀번호가 필요한데 config.yaml에는
 bcrypt 해시만 있어서 우리는 접근 불가 — 재시작이 유일한 해결 경로였다.
 
+**⚠ "재시작"은 저절로 되지 않는다 (P27에서 실전으로 확인)** — 부모 프로세스(omniroute 메인, PID 20)가
+`cliproxyapi` 자식 프로세스를 감시·자동 재기동해줄 거라 가정하고 `sh -c 'kill <pid>'`로 종료시켰더니
+**자동으로 다시 안 떴다** — `/proc` 재스캔 결과 프로세스가 완전히 죽은 채로 남아 `:8317` 전체가 잠깐(~10초)
+다운됐다. 직접 아래처럼 백그라운드로 재기동해야 한다:
+
+```bash
+ssh oracle1 "kubectl exec -n omniroute pod/<POD> -c omniroute -- sh -c \
+  'nohup /app/data/bin/cliproxyapi --config /app/data/services/cliproxy/config.yaml \
+   > /tmp/cliproxyapi-manual-restart.log 2>&1 &'"
+```
+
+`disown`은 이 컨테이너 셸에 없어 생략해도 무방(`kubectl exec` 세션이 끝나도 `nohup`만으로 프로세스가 계속
+살아있는 것을 확인함). 그리고 `kubectl exec pod -- kill <pid>`처럼 `sh -c`로 안 감싸면 컨테이너에 `kill`
+바이너리 자체가 없어서 즉시 실패한다(`exec: "kill": executable file not found`) — 반드시 `sh -c 'kill
+<pid>'`로 감쌀 것(이 컨테이너는 `ps`/`curl`도 없다는 기존 제약과 같은 종류).
+
 ### 5) 실제 키 값 확인 — 관리 API는 마스킹됨
 
 bifrost 관리 API(`GET /api/providers/{name}/keys`)는 키 값을 `sk-3************************xUXi`처럼
@@ -236,3 +252,13 @@ bifrost 세션 토큰(관리 API 인증용)도 같은 방식으로 얻는다: `s
 `isNativeProtocolPrefix`에 `/kilo/` 추가해 `PROXY_API_KEY` 보호 범위 포함. 상세: `문제_해결.md` P26.
 커밋: `165197f` — GET `/models` 무료 필터(P25)와 Kilo 라우트(P26) 둘 다 이 커밋 하나에 포함(배포·검증은
 각각 별도 시점에 44/44로 완료된 뒤 한 번에 커밋됨).
+
+### CLIProxyAPI `openai-compatibility`에 muse-spark 중복 등록 — `/chat/completions` 경유 504 (P27)
+
+§"config.yaml 패치 방법"으로 등록한 `opencode-chat`·`opencode-zen1-chat`(둘 다 `openai-compatibility`)의
+`models:` 목록에 muse-spark가 **`codex-api-key`(`opencode-res`/`opencode-zen1-res`)와 중복 등록**돼
+있었다 — OmniRoute의 자체 provider(`mycli`, `base_url: http://omniroute-scsi:8317/v1`)가 이 잘못된
+경로로 muse-spark를 호출하면 CLIProxyAPI가 `/chat/v1/chat/completions`(zen 실제 chat/completions
+passthrough)로 forward, muse-spark는 거기서 항상 hang → 30초 504. `openai-compatibility` 쪽 목록에서만
+muse-spark 2개 항목 제거해 해결. 부수적으로 **CLIProxyAPI는 kill해도 자동 재기동되지 않는다**는 걸 실전에서
+확인(§4 "핫 리로드 없음" 갱신 참고). 상세: `문제_해결.md` P27.

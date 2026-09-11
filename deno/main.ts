@@ -552,18 +552,36 @@ export default {
       if (!pbody.model) return json({ error: { message: 'model required' } }, 400);
       const isStream = !!pbody.stream;
       const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
-      // zen은 tools[].type: "image_generation"을 아예 지원하지 않아 항상 400 [invalid_request_error]
-      // Unsupported tool type을 낸다. CLIProxyAPI의 codex 실행기가 muse-spark 계열 /responses 호출에
-      // 이 tool을 기본으로 자동 주입해서 발생(클라이언트가 직접 보낸 tools엔 없음) — 순수 passthrough
-      // 원칙은 유지하되, 이 tool 타입이 섞여 있을 때만 그것만 제거하고 나머지 바디는 그대로 둔다.
+      // /res/v1/responses는 순수 passthrough(바디 무변형)가 원칙이지만, muse 계열에서 100% 확정적으로
+      // 실패하는 두 가지 케이스만 최소 개입으로 방어한다(res/chat/mes 설계 원칙과 같은 성격의 예외, P24/P28):
       let outText = rawText;
-      if (pathname === '/res/v1/responses' && Array.isArray(pbody.tools) && pbody.tools.some((t) => t && t.type === 'image_generation')) {
-        const filtered = pbody.tools.filter((t) => !(t && t.type === 'image_generation'));
-        const patched = { ...pbody, tools: filtered };
-        if (!filtered.length) delete patched.tools;
-        outText = JSON.stringify(patched);
-        console.warn('[compat] /res/v1/responses: stripped unsupported image_generation tool before forwarding to zen');
+      let patched = null;
+      if (pathname === '/res/v1/responses') {
+        // 1) zen은 tools[].type: "image_generation"을 아예 지원하지 않아 항상 400을 낸다. CLIProxyAPI의
+        //    codex 실행기가 muse-spark 계열 /responses 호출에 이 tool을 기본으로 자동 주입해서 발생
+        //    (클라이언트가 직접 보낸 tools엔 없음) — 이 tool 타입이 섞여 있을 때만 그것만 제거한다.
+        if (Array.isArray(pbody.tools) && pbody.tools.some((t) => t && t.type === 'image_generation')) {
+          patched = patched || { ...pbody };
+          const filtered = patched.tools.filter((t) => !(t && t.type === 'image_generation'));
+          patched.tools = filtered;
+          if (!filtered.length) delete patched.tools;
+          console.warn('[compat] /res/v1/responses: stripped unsupported image_generation tool before forwarding to zen');
+        }
+        // 2) muse는 실제 출력 전에 내부 reasoning으로 먼저 토큰을 소모한다. 클라이언트가 짧은 답변을
+        //    기대하고 max_output_tokens를 작게(예: 64) 보내면 reasoning만으로 예산이 다 소진돼
+        //    output:[]로 "성공"(200) 응답하는 채로 끝난다(P28 — OmniRoute 등 직접 호출 클라이언트에서
+        //    실측 재현: incomplete_details.reason:"max_output_tokens", output:[]). 레거시 변환 경로의
+        //    applyMuseDefaults()가 강제하던 131072 하한을 여기서도 동일하게 적용.
+        if (/muse/i.test(String(pbody.model || ''))) {
+          const reqMax = Number((patched || pbody).max_output_tokens) || 0;
+          if (reqMax < 131072) {
+            patched = patched || { ...pbody };
+            patched.max_output_tokens = Math.max(131072, reqMax);
+            console.warn('[compat] /res/v1/responses: raised max_output_tokens to 131072 floor for muse model (reasoning budget)');
+          }
+        }
       }
+      if (patched) outText = JSON.stringify(patched);
       try {
         const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: outText });
         const ct = fr.headers.get('content-type') || 'application/json';

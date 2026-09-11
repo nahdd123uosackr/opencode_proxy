@@ -262,3 +262,13 @@ bifrost 세션 토큰(관리 API 인증용)도 같은 방식으로 얻는다: `s
 passthrough)로 forward, muse-spark는 거기서 항상 hang → 30초 504. `openai-compatibility` 쪽 목록에서만
 muse-spark 2개 항목 제거해 해결. 부수적으로 **CLIProxyAPI는 kill해도 자동 재기동되지 않는다**는 걸 실전에서
 확인(§4 "핫 리로드 없음" 갱신 참고). 상세: `문제_해결.md` P27.
+
+### `/res/v1/responses`에 작은 `max_output_tokens`로 muse 호출 시 502 empty stream (P28)
+
+OmniRoute에 정상 등록된 또 다른 provider `openprox-res`(`base_url: .../res/v1`, `api_type: "responses"` —
+등록 자체는 정확함, `call_logs.target_format:"openai-responses"`로 확인)를 통해 muse-spark를 호출했는데
+`max_output_tokens:64`처럼 작은 값을 보내니 pool의 47개 노드 전부에서 동일하게 "empty stream" 판정을
+받아 502. muse는 실제 출력 전에 reasoning으로 먼저 토큰을 쓰는데, 예산이 작으면 reasoning만으로 다
+소진되고 `output:[]`인 채로 HTTP 200 "성공"한다 — 레거시 변환 경로가 강제하던 `max_output_tokens ≥
+131072` 하한이 이 순수 passthrough 경로엔 없어서 재발. 동일 하한을 muse 모델일 때만 추가해 해결(P24의
+image_generation 필터와 같은 성격의 최소 예외). 상세: `문제_해결.md` P28.

@@ -334,6 +334,125 @@ function sanitizeResponsesInput(input) {
   return out;
 }
 
+// P21 fix (2026-09-11): Anthropic /v1/messages → OpenAI /v1/chat/completions 정규화.
+// 기존 코드는 body.messages를 그대로 upstream에 전달하여
+//  - system이 top-level 문자열/배열인데 무시됨
+//  - content: [{type:"tool_use"}, {type:"tool_result"}, {type:"image"}] 가 OpenAI 스키마와 불일치
+//  - tools: {input_schema} → {parameters} 미변환, tool_choice 매핑 누락
+// 으로 Hermes/Claude Code의 tool/image 요청이 침묵 실패. 유의사항.md §muse 경로별 variant 유지.
+function anthropicSystemToMessages(system) {
+  if (!system) return [];
+  if (typeof system === 'string') return [{ role: 'system', content: system }];
+  if (Array.isArray(system)) {
+    const text = system.map(b => b.text || b.content || '').filter(Boolean).join('\n');
+    return text ? [{ role: 'system', content: text }] : [];
+  }
+  return [{ role: 'system', content: String(system) }];
+}
+function anthropicContentToOpenAIBlocks(content, role) {
+  // Anthropic array → OpenAI array (text/image) + toolResults 분리
+  if (typeof content === 'string') return { blocks: [{ type: 'text', text: content }], toolResults: [] };
+  if (!Array.isArray(content)) return { blocks: [{ type: 'text', text: String(content ?? '') }], toolResults: [] };
+  const blocks = [];
+  const toolResults = [];
+  for (const b of content) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text') blocks.push({ type: 'text', text: b.text || '' });
+    else if (b.type === 'image') {
+      const src = b.source;
+      if (src && src.type === 'base64' && src.data) {
+        const url = `data:${src.media_type || 'image/png'};base64,${src.data}`;
+        blocks.push({ type: 'image_url', image_url: { url } });
+      } else if (src && src.type === 'url' && src.url) {
+        blocks.push({ type: 'image_url', image_url: { url: src.url } });
+      } else if (b.url) {
+        blocks.push({ type: 'image_url', image_url: { url: b.url } });
+      }
+    } else if (b.type === 'tool_result') {
+      let c = b.content;
+      if (Array.isArray(c)) c = c.map(x => x.text || x.content || '').join('\n');
+      else if (c && typeof c === 'object') c = JSON.stringify(c);
+      toolResults.push({ role: 'tool', tool_call_id: b.tool_use_id || b.tool_call_id || '', content: String(c ?? '') });
+    } else if (b.type === 'tool_use') {
+      // assistant의 tool_use는 이 함수가 아니라 anthropicMessagesToOpenAI에서 tool_calls로 분리됨
+      // user content에 잘못 섞인 경우 텍스트로 퇴화
+      if (b.input) blocks.push({ type: 'text', text: JSON.stringify(b.input) });
+    } else if (b.type === 'thinking') {
+      // reasoning block — 요청에서는 무시 (응답에서는 thinking으로 변환됨)
+      continue;
+    } else if (b.type === 'input_text' || b.type === 'output_text') {
+      blocks.push({ type: 'text', text: b.text || '' });
+    } else if (b.type === 'image_url' && b.image_url) {
+      blocks.push(b);
+    } else if (typeof b.text === 'string') {
+      blocks.push({ type: 'text', text: b.text });
+    }
+  }
+  return { blocks, toolResults };
+}
+function anthropicMessagesToOpenAI(body) {
+  const out = [];
+  out.push(...anthropicSystemToMessages(body.system));
+  for (const m of body.messages || []) {
+    if (m.role === 'user') {
+      const { blocks, toolResults } = anthropicContentToOpenAIBlocks(m.content, 'user');
+      if (blocks.length) {
+        if (blocks.length === 1 && blocks[0].type === 'text' && toolResults.length === 0) {
+          out.push({ role: 'user', content: blocks[0].text });
+        } else {
+          out.push({ role: 'user', content: blocks });
+        }
+      } else if (toolResults.length === 0) {
+        out.push({ role: 'user', content: String(m.content ?? '') });
+      }
+      for (const tr of toolResults) out.push(tr);
+    } else if (m.role === 'assistant') {
+      if (typeof m.content === 'string') {
+        out.push({ role: 'assistant', content: m.content });
+      } else if (Array.isArray(m.content)) {
+        const texts = [];
+        const toolCalls = [];
+        for (const b of m.content) {
+          if (!b || typeof b !== 'object') continue;
+          if (b.type === 'text') texts.push(b.text || '');
+          else if (b.type === 'tool_use') {
+            toolCalls.push({ id: b.id || `call_${crypto.randomUUID().slice(0,8)}`, type: 'function', function: { name: b.name || '', arguments: JSON.stringify(b.input || {}) } });
+          } else if (b.type === 'thinking') continue;
+          else if (typeof b.text === 'string') texts.push(b.text);
+        }
+        const content = texts.join('\n') || null;
+        if (toolCalls.length) out.push({ role: 'assistant', content, tool_calls: toolCalls });
+        else out.push({ role: 'assistant', content: content || '' });
+      } else {
+        out.push({ role: 'assistant', content: String(m.content ?? '') });
+      }
+    } else if (m.role === 'system') {
+      // 이미 system으로 분리했으나, messages 내 system도 허용
+      const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+      out.push({ role: 'system', content: text });
+    } else if (m.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: m.tool_call_id || m.tool_use_id || '', content: String(m.content ?? '') });
+    }
+  }
+  return out;
+}
+function anthropicToolsToOpenAI(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  return tools.map(t => {
+    if (t.type === 'function' && t.function) return t;
+    return { type: 'function', function: { name: t.name || t.function?.name || '', description: t.description || t.function?.description || '', parameters: t.input_schema || t.parameters || t.function?.parameters || { type: 'object', properties: {} } } };
+  });
+}
+function anthropicToolChoiceToOpenAI(tc) {
+  if (!tc) return undefined;
+  if (typeof tc === 'string') return tc;
+  if (tc.type === 'auto') return 'auto';
+  if (tc.type === 'any') return 'required';
+  if (tc.type === 'tool' && tc.name) return { type: 'function', function: { name: tc.name } };
+  if (tc.type === 'function') return tc;
+  return tc;
+}
+
 function responsesToChatJson(r, model) {
   let content = '';
   const toolCalls = [];
@@ -874,7 +993,21 @@ const handle = async (req, res) => {
     
     const zenApiKey = isZen ? clientKey : null;
     const { upstreamModel, variant } = parseModel(body.model);
-    let openReq = { model: upstreamModel, messages: body.messages || [], max_tokens: body.max_tokens, temperature: body.temperature, top_p: body.top_p, stream: !!body.stream, stop: body.stop_sequences };
+    // P21: Anthropic → OpenAI 정규화 (system/tool/image/tool_result)
+    const anthMessages = anthropicMessagesToOpenAI(body);
+    const anthTools = anthropicToolsToOpenAI(body.tools);
+    const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
+    let openReq = {
+      model: upstreamModel,
+      messages: anthMessages,
+      max_tokens: body.max_tokens,
+      temperature: body.temperature,
+      top_p: body.top_p,
+      stream: !!body.stream,
+      stop: body.stop_sequences,
+      ...(anthTools ? { tools: anthTools } : {}),
+      ...(anthToolChoice ? { tool_choice: anthToolChoice } : {})
+    };
     openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), variant);
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
     

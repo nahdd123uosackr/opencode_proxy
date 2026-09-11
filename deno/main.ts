@@ -531,6 +531,15 @@ export default {
           if (variant && !String(kBody.model).includes(':')) kBody.model += ':' + variant;
           const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: injectHeaders({ 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' }), body: JSON.stringify(kBody) });
           r = new Response(await kr.text(), { status: kr.status, headers: { 'Content-Type': kr.headers.get('content-type') || 'application/json' } });
+        } else if (isMuse) {
+          // P21-fix (2026-09-11): muse-spark는 /chat/completions를 지원하지 않아
+          // (P9 등, upstream이 빈 응답/500을 반환) /responses로 우회해야 한다.
+          // api/index.js는 이 분기가 있었는데 deno 포팅 시 누락돼 muse 모델 +
+          // /v1/messages 조합이 전부 500(Internal server error)으로 깨졌었다.
+          // museChatResponse가 이미 /responses 왕복 + OpenAI chat.completion(.chunk)
+          // 형태 변환을 다 처리하므로 그대로 재사용 — 아래 공통 경로(SSE 그대로
+          // 포워드 / JSON 파싱 후 Anthropic 변환)가 동일하게 적용된다.
+          r = await museChatResponse(upstreamModel, full, variant, isStream);
         } else {
           r = await forward('/chat/completions', full, isStream);
         }

@@ -207,3 +207,32 @@ bifrost 세션 토큰(관리 API 인증용)도 같은 방식으로 얻는다: `s
    가능하다. 평문 비밀번호를 알아내거나 새로 설정할 방법이 있으면 운영이 훨씬 편해진다.
 4. bifrost `openai` 커스텀 프로바이더는 여전히 muse-spark류(Responses 전용 모델)를 등록 못 한다 — 이
    부분은 CLIProxyAPI의 `codex-api-key` 섹션으로 완전히 대체됨.
+
+## 후속 확장: GET /models 무료 필터링 누락 수정 + `/kilo/v1/*` 전용 라우트 신설 (2026-09-11 후속)
+
+### GET /models 무료 필터링 누락 (P25)
+
+`GET /res|chat|mes/v1/models`는 위 §2 "새 라우트 3개" 설계 당시 POST 쪽과 같은 "바디 무변형 passthrough"
+원칙을 그대로 적용해서 zen 업스트림 `/models` 응답을 필터 없이 반환하고 있었다 — 레거시 `GET /v1/models`는
+키 종류와 무관하게 항상 무료 모델만 반환하는데, 신규 라우트만 유료 모델(`claude-opus-5` 등)까지 그대로
+노출된 것. 응답 바디의 `data` 배열을 `id.endsWith('-free') || KNOWN_FREE_EXTRA.has(id)` 기준(레거시와 동일
+기준)으로 필터링하도록 수정. 상세: `문제_해결.md` P25. 3개 사본 동일 적용 후 44/44 재배포·검증.
+
+### Kilo 키가 이 라우트군에서 무시되는 건 버그가 아니라 설계 (P26)
+
+"Kilo 키를 넣으면 Kilo 모델만 반환되나?" 질문에서 시작 — 레거시 `/v1/models`는 실제로 Kilo/Zen 키에 따라
+분기하지만, `/res|chat|mes/*`는 애초에 **zen 전용**으로 설계돼 있어(POST 쪽도 Kilo 분기 없음) Kilo 키를
+넣어도 항상 zen 모델만 나온다. Kilo는 zen과 무관한 별도 서비스라 이 라우트군이 풀려던 "zen 모델별
+엔드포인트 불일치" 문제 자체가 없기 때문 — 회귀가 아님을 `git log -S"KILO_BASE"`(전체 히스토리에서 Kilo
+라우팅 코드가 한 번도 수정된 적 없음)로 확인.
+
+이후 사용자 요청으로 Kilo도 동일한 네이티브 passthrough 원칙의 전용 라우트를 신설:
+
+| 경로 | 동작 |
+|---|---|
+| `GET /kilo/v1/models` | 기존 `getKiloFreeModels()` 재사용, 무료만, `kilo/` 접두사는 벗기고 반환 |
+| `POST /kilo/v1/chat/completions` | `KILO_BASE + '/chat/completions'`로 직접 forward. `kilo/` 접두사 방어적 스트립, 클라이언트 `Authorization` 있으면 전달(없으면 키 없이 무료 모델 접근 허용), `reasoning_effort`/`reasoningEffort` 무조건 제거(P17 재발 방지) |
+
+`isNativeProtocolPrefix`에 `/kilo/` 추가해 `PROXY_API_KEY` 보호 범위 포함. 상세: `문제_해결.md` P26.
+커밋: `165197f` — GET `/models` 무료 필터(P25)와 Kilo 라우트(P26) 둘 다 이 커밋 하나에 포함(배포·검증은
+각각 별도 시점에 44/44로 완료된 뒤 한 번에 커밋됨).

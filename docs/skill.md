@@ -117,7 +117,7 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
   `framework`가 `node`로 오감지돼 `vercel.json`의 서버리스 라우팅이 무시되고 **모든 요청이
   404**로 죽는다(P16). `redeploy.sh`는 매 배포마다 자동으로 이 PATCH를 건다.
 
-## 6. 문제 해결 이력 요약 (P0~P24, 상세는 `문제_해결.md`)
+## 6. 문제 해결 이력 요약 (P0~P26, 상세는 `문제_해결.md`)
 
 | # | 증상 | 원인 한 줄 |
 |---|---|---|
@@ -139,6 +139,8 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
 | P21 | Anthropic `/v1/messages` `system`/`tool`/`image` 침묵 실패 | `body.messages`만 전달, `system`·`tool_result`→`tool`·`image`→`image_url`·`input_schema→parameters` 미변환 → `anthropicMessagesToOpenAI` 등 4개 헬퍼로 복원 |
 | P23 | `think`/`effort` 무시 및 `responses` `reasoning` 중복 400 | 콜론 외 `reasoning_effort`/`thinking.budget_tokens` 무시(항상 low) + `responses` muse에서 flat+nested 중복 → `effectiveVariant` fallback + flat `delete`로 수정(`138fd40`) |
 | P24 | CLIProxyAPI 경유 muse-spark `/res/v1/responses` 400 `Unsupported tool type: image_generation` | CLIProxyAPI codex 실행기가 `tools`에 `{type:"image_generation"}`을 기본 자동 주입, zen이 그 타입 자체를 미지원 → `/res/v1/responses`에서 그 tool 항목만 걸러내고 나머지 바디는 그대로 passthrough |
+| P25 | `/res|chat|mes/v1/models`가 유료 모델까지 노출 | GET `/models`에 POST용 "바디 무변형" 원칙을 그대로 적용해 무료 필터 누락 → `id.endsWith('-free')||KNOWN_FREE_EXTRA` 기준으로 필터링 추가 |
+| P26 | Kilo 키가 `/res|chat|mes/*`에서 무시됨 | 버그 아님 — 이 라우트군은 애초에 zen 전용(Kilo 분기 없음) 설계. `/kilo/v1/models`+`/kilo/v1/chat/completions` 전용 라우트 신설로 해결 |
 
 **교훈 총정리(반복해서 나온 것들)**:
 1. 헬스 프로브 성공 ≠ 실제 요청 경로 정상. 회귀 검증은 항상 클라이언트가 실제로 때리는 엔드포인트로.

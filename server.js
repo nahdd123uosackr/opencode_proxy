@@ -5,9 +5,9 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/zen/v1';
 
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
-  
+
   // Health check
   if (url === '/health' || url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -35,3 +35,23 @@ http.createServer((req, res) => {
 }).listen(PORT, HOST, () => {
   console.log(`opencode-proxy listening on ${HOST}:${PORT}, upstream=${UPSTREAM}`);
 });
+
+// 2026-09-11: server.js never kept a reference to the server, so the SIGTERM
+// handler in api/index.js (shuttingDown=true only) had no way to actually
+// close the server or exit the process -- the container/VM's orchestrator
+// (systemd TimeoutStopSec, Docker stop grace period, etc.) would hang for its
+// full grace window before force-killing. Same fix as the local systemd
+// variant of server.js.
+function gracefulShutdown(signal) {
+  console.log(`[shutdown] received ${signal}, closing server (in-flight requests get to finish)`);
+  server.close(() => {
+    console.log('[shutdown] server closed cleanly, exiting');
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.log('[shutdown] force exit after grace period');
+    process.exit(0);
+  }, 10000).unref();
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

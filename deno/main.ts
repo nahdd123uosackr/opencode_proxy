@@ -501,7 +501,7 @@ export default {
     if (pathname === '/health' || pathname === '/v1/health') {
       return json({ status: 'ok', upstream: UPSTREAM });
     }
-    const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/');
+    const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/');
     if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(request, env)) {
       return json({ error: { type: 'authentication_error', message: 'Invalid API key' } }, 401);
     }
@@ -515,8 +515,29 @@ export default {
       try {
         const headers = injectHeaders({ 'Content-Type': 'application/json' });
         const fr = await fetch(UPSTREAM + '/models', { method: 'GET', headers });
-        const text = await fr.text();
-        return new Response(text, { status: fr.status, headers: { ...CORS, 'Content-Type': fr.headers.get('content-type') || 'application/json' } });
+        if (!fr.ok) {
+          const text = await fr.text();
+          return new Response(text, { status: fr.status, headers: { ...CORS, 'Content-Type': fr.headers.get('content-type') || 'application/json' } });
+        }
+        // 나머지 프록시 전체가 무료 모델만 노출하는 것과 맞춰(getFreeModelsExpanded와 동일 기준),
+        // 이 native passthrough GET /models도 응답 바디에서 유료 모델을 걸러내고 반환한다. id는
+        // CLIProxyAPI 등이 그대로 참조하는 zen 네이티브 id라 opencode/ 접두사는 붙이지 않는다.
+        const upstreamJson = await fr.json();
+        const filtered = Array.isArray(upstreamJson.data)
+          ? upstreamJson.data.filter((m) => m && m.id && (m.id.endsWith('-free') || KNOWN_FREE_EXTRA.has(m.id)))
+          : [];
+        return json({ ...upstreamJson, data: filtered }, 200);
+      } catch (e) { return json({ error: { message: e.message } }, 502); }
+    }
+
+    // Kilo Gateway는 zen과 완전히 별개 서비스라 UPSTREAM(zen) 기반 passthrough 그룹에 못 낀다.
+    // /res|chat|mes와 같은 원칙(네이티브 엔드포인트로 바디 최소 변형 전달)으로 Kilo 전용 라우트를
+    // 별도로 둔다 — 모델 리스트는 무료만(getKiloFreeModels 재사용, 접두사만 벗김).
+    if (request.method === 'GET' && pathname === '/kilo/v1/models') {
+      try {
+        const kiloModels = await getKiloFreeModels();
+        const data = kiloModels.map((m) => ({ ...m, id: m.id.replace(/^kilo\//, '') }));
+        return json({ object: 'list', data });
       } catch (e) { return json({ error: { message: e.message } }, 502); }
     }
 
@@ -551,6 +572,33 @@ export default {
         }
         const text = await fr.text();
         return new Response(text, { status: fr.status, headers: { ...CORS, 'Content-Type': ct } });
+      } catch (e) { return json({ error: { message: e.message } }, 502); }
+    }
+
+    if (request.method === 'POST' && pathname === '/kilo/v1/chat/completions') {
+      const rawText = await request.text();
+      let pbody; try { pbody = JSON.parse(rawText || '{}'); } catch { return json({ error: { message: 'Invalid JSON' } }, 400); }
+      if (!pbody.model) return json({ error: { message: 'model required' } }, 400);
+      const realModel = String(pbody.model).replace(/^kilo\//i, '');
+      let msgs = Array.isArray(pbody.messages) ? pbody.messages : [];
+      if (!msgs.length && Array.isArray(pbody.input)) {
+        msgs = pbody.input.map((i) => ({ role: i.role || 'user', content: typeof i.content === 'string' ? i.content : Array.isArray(i.content) ? i.content.map((c) => c.text || '').join('') : '' }));
+      }
+      const isStream = !!pbody.stream;
+      const kHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
+      const clientAuth = request.headers.get('authorization');
+      if (clientAuth) kHeaders.Authorization = clientAuth;
+      // Kilo가 라우팅하는 모델(예: kilo-auto)에 자체적으로 reasoning.effort를 강제 배정해서
+      // 클라이언트가 보낸 reasoning_effort와 충돌하면 400을 낸다(P17) — 이 전용 경로도 동일 방어.
+      const kiloBody = { ...pbody, model: realModel, messages: msgs };
+      delete kiloBody.reasoning_effort;
+      delete kiloBody.reasoningEffort;
+      try {
+        const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: kHeaders, body: JSON.stringify(kiloBody) });
+        if (isStream && kr.ok) {
+          return new Response(kr.body, { status: 200, headers: { ...CORS, 'Content-Type': kr.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' } });
+        }
+        return new Response(await kr.text(), { status: kr.status, headers: { ...CORS, 'Content-Type': kr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' } });
       } catch (e) { return json({ error: { message: e.message } }, 502); }
     }
 

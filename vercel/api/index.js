@@ -871,7 +871,7 @@ const handle = async (req, res) => {
     }
   }
 
-  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/');
+  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/');
   if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid API key' } }));
@@ -1298,8 +1298,34 @@ const handle = async (req, res) => {
     const headers = injectHeaders({ 'Content-Type': 'application/json' }, null, zenApiKey);
     try {
       const fr = await fetch(UPSTREAM + '/models', { method: 'GET', headers, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
-      res.writeHead(fr.status, { 'Content-Type': fr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(await fr.text());
+      if (!fr.ok) {
+        res.writeHead(fr.status, { 'Content-Type': fr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(await fr.text());
+      }
+      // 나머지 프록시 전체가 무료 모델만 노출하는 것과 맞춰(getFreeModelsExpanded와 동일 기준),
+      // 이 native passthrough GET /models도 응답 바디에서 유료 모델을 걸러내고 반환한다. id는
+      // CLIProxyAPI 등이 그대로 참조하는 zen 네이티브 id라 opencode/ 접두사는 붙이지 않는다.
+      const upstreamJson = await fr.json();
+      const filtered = Array.isArray(upstreamJson.data)
+        ? upstreamJson.data.filter(m => m && m.id && (m.id.endsWith('-free') || KNOWN_FREE_EXTRA.has(m.id)))
+        : [];
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ ...upstreamJson, data: filtered }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  // Kilo Gateway는 zen과 완전히 별개 서비스라 UPSTREAM(zen) 기반 passthrough 그룹에 못 낀다.
+  // /res|chat|mes와 같은 원칙(네이티브 엔드포인트로 바디 최소 변형 전달)으로 Kilo 전용 라우트를
+  // 별도로 둔다 — 모델 리스트는 무료만(getKiloFreeModels 재사용, 접두사만 벗김).
+  if (pathname === '/kilo/v1/models') {
+    try {
+      const kiloModels = await getKiloFreeModels();
+      const data = kiloModels.map(m => ({ ...m, id: m.id.replace(/^kilo\//, '') }));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ object: 'list', data }));
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: e.message } }));
@@ -1346,6 +1372,42 @@ const handle = async (req, res) => {
         return res.end();
       }
       return res.end(await fr.text());
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  if (req.method === 'POST' && pathname === '/kilo/v1/chat/completions') {
+    const rawBody = Buffer.concat(chunks).toString('utf-8');
+    let body; try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'Invalid JSON' } })); }
+    if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
+    const realModel = String(body.model).replace(/^kilo\//i, '');
+    let msgs = Array.isArray(body.messages) ? body.messages : [];
+    if (!msgs.length && Array.isArray(body.input)) {
+      msgs = body.input.map(i => ({ role: i.role || 'user', content: typeof i.content === 'string' ? i.content : Array.isArray(i.content) ? i.content.map(c => c.text || '').join('') : '' }));
+    }
+    const isStream = !!body.stream;
+    const kHeaders = { 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' };
+    if (req.headers.authorization) kHeaders['Authorization'] = req.headers.authorization;
+    // Kilo가 라우팅하는 모델(예: kilo-auto)에 자체적으로 reasoning.effort를 강제 배정해서
+    // 클라이언트가 보낸 reasoning_effort와 충돌하면 400을 낸다(P17) — 이 전용 경로도 동일 방어.
+    const kiloBody = { ...body, model: realModel, messages: msgs };
+    delete kiloBody.reasoning_effort;
+    delete kiloBody.reasoningEffort;
+    try {
+      const kr = await fetch(KILO_BASE + '/chat/completions', {
+        method: 'POST', headers: kHeaders, body: JSON.stringify(kiloBody),
+        signal: AbortSignal.timeout(parseInt(process.env.KILO_STREAM_TIMEOUT_MS || '300000', 10))
+      });
+      const ct = kr.headers.get('content-type') || 'application/json';
+      res.writeHead(kr.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+      if (isStream && kr.body && ct.includes('text/event-stream')) {
+        const reader = kr.body.getReader(); const dec = new TextDecoder();
+        try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(dec.decode(value, { stream: true })); } } catch {}
+        return res.end();
+      }
+      return res.end(await kr.text());
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: e.message } }));

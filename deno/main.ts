@@ -501,8 +501,45 @@ export default {
     if (pathname === '/health' || pathname === '/v1/health') {
       return json({ status: 'ok', upstream: UPSTREAM });
     }
-    if (pathname.startsWith('/v1/') && !authOk(request, env)) {
+    const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/');
+    if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(request, env)) {
       return json({ error: { type: 'authentication_error', message: 'Invalid API key' } }, 401);
+    }
+
+    // 2026-09-11 설계 전환 (api/index.js와 동일): 프로토콜 변환 대신 모델이 실제로
+    // 지원하는 네이티브 엔드포인트로만 라우팅한다. bifrost에 res/chat/mes 세
+    // 프로바이더로 등록해서 모델별로 동작하는 엔드포인트만 쓰도록 강제 — 바디를
+    // 건드리지 않는 순수 passthrough라 변환 버그(P3/P9/P14/P20/P21/P23) 계열이
+    // 구조적으로 발생할 수 없다.
+    if (request.method === 'GET' && (pathname === '/res/v1/models' || pathname === '/chat/v1/models' || pathname === '/mes/v1/models')) {
+      try {
+        const headers = injectHeaders({ 'Content-Type': 'application/json' });
+        const fr = await fetch(UPSTREAM + '/models', { method: 'GET', headers });
+        const text = await fr.text();
+        return new Response(text, { status: fr.status, headers: { ...CORS, 'Content-Type': fr.headers.get('content-type') || 'application/json' } });
+      } catch (e) { return json({ error: { message: e.message } }, 502); }
+    }
+
+    const NATIVE_PASSTHROUGH_ROUTES = {
+      '/res/v1/responses': '/responses',
+      '/chat/v1/chat/completions': '/chat/completions',
+      '/mes/v1/messages': '/messages',
+    };
+    if (request.method === 'POST' && NATIVE_PASSTHROUGH_ROUTES[pathname]) {
+      const rawText = await request.text();
+      let pbody; try { pbody = JSON.parse(rawText || '{}'); } catch { return json({ error: { message: 'Invalid JSON' } }, 400); }
+      if (!pbody.model) return json({ error: { message: 'model required' } }, 400);
+      const isStream = !!pbody.stream;
+      const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+      try {
+        const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: rawText });
+        const ct = fr.headers.get('content-type') || 'application/json';
+        if (isStream && ct.includes('text/event-stream')) {
+          return new Response(fr.body, { status: fr.status, headers: { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });
+        }
+        const text = await fr.text();
+        return new Response(text, { status: fr.status, headers: { ...CORS, 'Content-Type': ct } });
+      } catch (e) { return json({ error: { message: e.message } }, 502); }
     }
 
     if (request.method === 'GET' && pathname === '/v1/models') {

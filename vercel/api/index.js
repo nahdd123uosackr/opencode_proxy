@@ -798,6 +798,22 @@ function applyVariant(upstreamBody, variant) {
   return upstreamBody;
 }
 
+// Compat-retry safety net (idea borrowed from LiveXY/responses-to-chat's "부분 400
+// 파라미터 불일치 시 필드 제거 후 1회 재시도"): our P3/P9/P14/P20 bugs were all the
+// same shape — Zen rejects one optional field it doesn't support yet, and we only
+// found out after a real client hit it. Rather than waiting for the next one to
+// surface as a new P-number, strip the offending optional field and retry once
+// instead of failing the whole request. Only ever touches fields we already know
+// are optional — never touches required fields like model/input/messages.
+const OPTIONAL_DEGRADE_FIELDS = ['metadata', 'parallel_tool_calls', 'previous_response_id', 'store', 'service_tier', 'reasoning'];
+function detectDegradableField(errorBodyText) {
+  const t = String(errorBodyText || '');
+  for (const f of OPTIONAL_DEGRADE_FIELDS) {
+    if (t.includes(`"${f}"`) || t.includes(`'${f}'`)) return f;
+  }
+  return null;
+}
+
 const MUSE_EFFORT = {
   minimal: 'low',
   low: 'low',
@@ -855,7 +871,8 @@ const handle = async (req, res) => {
     }
   }
 
-  if (pathname.startsWith('/v1/') && !authOk(req)) {
+  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/');
+  if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid API key' } }));
   }
@@ -1243,8 +1260,72 @@ const handle = async (req, res) => {
 
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
     try {
-      const fr = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      let fr = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      if (fr.status === 400) {
+        const errText = await fr.text();
+        const field = detectDegradableField(errText);
+        if (field && Object.prototype.hasOwnProperty.call(upstreamBody, field)) {
+          console.warn(`[compat-retry] /v1/responses 400 mentions "${field}", stripping and retrying once`);
+          const degraded = { ...upstreamBody };
+          delete degraded[field];
+          fr = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(degraded), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+        } else {
+          res.writeHead(400, { 'Content-Type': fr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
+          return res.end(errText);
+        }
+      }
       res.writeHead(fr.status === 200 ? 200 : fr.status, { 'Content-Type': fr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(await fr.text());
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  // ============================================================
+  // 2026-09-11 설계 전환: 프로토콜 간 변환을 시도하는 대신, 모델이 실제로 지원하는
+  // 네이티브 엔드포인트로만 라우팅한다. zen 업스트림은 /chat/completions,
+  // /responses, /v1/messages를 전부 자체 제공하지만(세 경로 모두 401 확인 —
+  // 존재는 함) 모델별로 어느 엔드포인트가 실제로 동작하는지는 다르다(예: muse-spark는
+  // /chat/completions에서 빈 응답, /responses만 정상 — P9/P21이 이 문제를 변환
+  // 레이어에서 우회하려다 반복적으로 재발했다). 변환 로직으로 모든 조합을 커버하려던
+  // 기존 접근 대신, bifrost에 프로토콜별 프로바이더 3개(res/chat/mes)를 등록해서
+  // "이 모델은 애초에 이 엔드포인트로만 부른다"를 강제한다.
+  // 아래 6개 라우트는 바디를 전혀 건드리지 않는 순수 passthrough다 — 변환 버그
+  // (P3/P9/P14/P20/P21/P23) 계열 자체가 구조적으로 발생할 수 없다.
+  if (pathname === '/res/v1/models' || pathname === '/chat/v1/models' || pathname === '/mes/v1/models') {
+    const zenApiKey = isZen ? clientKey : null;
+    const headers = injectHeaders({ 'Content-Type': 'application/json' }, null, zenApiKey);
+    try {
+      const fr = await fetch(UPSTREAM + '/models', { method: 'GET', headers, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      res.writeHead(fr.status, { 'Content-Type': fr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(await fr.text());
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  const NATIVE_PASSTHROUGH_ROUTES = {
+    '/res/v1/responses': '/responses',
+    '/chat/v1/chat/completions': '/chat/completions',
+    '/mes/v1/messages': '/messages',
+  };
+  if (req.method === 'POST' && NATIVE_PASSTHROUGH_ROUTES[pathname]) {
+    const rawBody = Buffer.concat(chunks).toString('utf-8');
+    let body; try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'Invalid JSON' } })); }
+    if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
+    const zenApiKey = isZen ? clientKey : null;
+    const isStream = !!body.stream;
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    try {
+      const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: rawBody, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      const ct = fr.headers.get('content-type') || 'application/json';
+      res.writeHead(fr.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+      if (isStream && fr.body && ct.includes('text/event-stream')) {
+        for await (const chunk of fr.body) res.write(chunk);
+        return res.end();
+      }
       return res.end(await fr.text());
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });

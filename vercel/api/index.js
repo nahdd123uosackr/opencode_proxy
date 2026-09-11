@@ -267,17 +267,6 @@ function truncateInputIfNeeded(input, instructions, maxTokens) {
   console.log(`[truncate] input ${input.length}→${truncated.length} tokens ${total}→${keptTokens} (max ${MAX})`);
   return truncated;
 }
-function truncateAnthropicBodyIfNeeded(body) {
-  const MAX = parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
-  const sysTokens = estimateTokens(JSON.stringify(body.system || ''));
-  const msgTokens = totalPromptTokensForMessages(body.messages || [], null);
-  const total = sysTokens + msgTokens;
-  if (total <= MAX) return body;
-  // system은 보존, messages는 뒤에서부터 유지
-  const truncatedMessages = truncateMessagesIfNeeded(body.messages || [], body.system, MAX - sysTokens - 100);
-  console.log(`[truncate] anthropic messages ${body.messages.length}→${truncatedMessages.length} tokens ${total}→${sysTokens + totalPromptTokensForMessages(truncatedMessages, null)} (max ${MAX})`);
-  return { ...body, messages: truncatedMessages };
-}
 
 function applyMuseDefaults(body, api) {
   if (/muse/i.test(String(body.model || ''))) {
@@ -1113,11 +1102,8 @@ const handle = async (req, res) => {
   }
 
   // ============================================================
-  // POST /v1/messages (Anthropic API 형식 — zen 네이티브 직통, P21/P23 간소화)
+  // POST /v1/messages (Anthropic API 형식 3단 분기)
   // ============================================================
-  // zen이 POST /v1/messages를 네이티브로 지원하므로 이중 변환(Anthropic→OpenAI→Responses→Anthropic)을 제거하고
-  // 원형 그대로 직통한다. bifrost가 chat으로 등록해도 자동 변환하지 않으므로 프록시가 변환할 필요가 없고,
-  // zen이 thinking/tool/image를 직접 처리하므로 프록시 측 anthropic 변환 레이어는 Kilo 전용으로만 남긴다.
   if (req.method === 'POST' && pathname === '/v1/messages') {
     let body; const rawBody = Buffer.concat(chunks).toString('utf-8'); try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Invalid JSON' } })); }
     applyMinTokens(body);
@@ -1125,78 +1111,92 @@ const handle = async (req, res) => {
     
     const zenApiKey = isZen ? clientKey : null;
     const { upstreamModel, variant } = parseModel(body.model);
-    // 대형 프롬프트 빈 choices 방지 — Anthropic 원형 트렁케이트
-    if (body.messages || body.system) {
-      const tmp = truncateAnthropicBodyIfNeeded(body);
-      body.messages = tmp.messages;
-      body.system = tmp.system;
-    }
-    const isKilo = /^kilo\//i.test(String(body.model || '')) || isKiloKey(clientKey);
-    // Kilo Gateway는 messages 네이티브를 지원하지 않으므로 기존처럼 Anthropic→OpenAI 변환 후 Kilo chat으로
-    if (isKilo) {
-      const anthMessages = anthropicMessagesToOpenAI(body);
-      const anthTools = anthropicToolsToOpenAI(body.tools);
-      const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
-      let openReq = {
-        model: upstreamModel,
-        messages: truncateMessagesIfNeeded(anthMessages, body.system),
-        max_tokens: body.max_tokens,
-        temperature: body.temperature,
-        top_p: body.top_p,
-        stream: !!body.stream,
-        stop: body.stop_sequences,
-        ...(anthTools ? { tools: anthTools } : {}),
-        ...(anthToolChoice ? { tool_choice: anthToolChoice } : {})
-      };
-      openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), variant);
-      const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, null);
-      // Kilo는 항상 chat completions
-      const kBody = { ...openReq, model: String(openReq.model).replace(/^kilo\//i, '').replace(/^opencode\//, '') };
-      delete kBody.reasoning_effort; delete kBody.reasoningEffort;
-      if (variant && !String(kBody.model).includes(':')) kBody.model += ':' + variant;
-      try {
-        const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers, body: JSON.stringify(kBody), signal: AbortSignal.timeout(parseInt(process.env.KILO_STREAM_TIMEOUT_MS || '300000', 10)) });
-        if (body.stream && kr.ok) {
-          res.writeHead(200, { 'Content-Type': kr.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' });
-          const reader = kr.body.getReader(); const dec = new TextDecoder();
-          try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(dec.decode(value, { stream: true })); } } catch {}
+    // P23: 콜론 접미사가 없으면 Claude의 thinking(budget_tokens) -> 그다음
+    // reasoning_effort/reasoning.effort 순서로 effort를 추정한다. 이전에는 콜론
+    // 접미사가 없으면 무조건 'low'로 깔려서 클라이언트가 요청한 thinking/effort가
+    // muse-spark 경로에서 통째로 무시됐다.
+    const effectiveVariant = variant || effortFromThinking(body.thinking) || effortFromClientBody(body);
+    // P21: Anthropic → OpenAI 정규화 (system/tool/image/tool_result)
+    let anthMessages = anthropicMessagesToOpenAI(body);
+    // 대형 프롬프트 빈 choices 방지
+    anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
+    const anthTools = anthropicToolsToOpenAI(body.tools);
+    const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
+    let openReq = {
+      model: upstreamModel,
+      messages: anthMessages,
+      max_tokens: body.max_tokens,
+      temperature: body.temperature,
+      top_p: body.top_p,
+      stream: !!body.stream,
+      stop: body.stop_sequences,
+      ...(anthTools ? { tools: anthTools } : {}),
+      ...(anthToolChoice ? { tool_choice: anthToolChoice } : {})
+    };
+    openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), effectiveVariant);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+
+    try {
+      let fetchRes;
+      if (/muse/i.test(upstreamModel)) {
+        const mfr = await museViaResponses(upstreamModel, openReq, effectiveVariant, !!body.stream, zenApiKey);
+        if (!mfr.ok) { const t = await mfr.text(); res.writeHead(mfr.status, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: t.slice(0, 500) } })); }
+        if (body.stream) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+          if (res.flushHeaders) res.flushHeaders();
+          const aw = createAnthropicStreamWriter(c => res.write(c), upstreamModel, 0);
+          await pumpResponsesSSEToAnthropic(mfr.body, aw);
           return res.end();
         }
-        const t = await kr.text();
-        // Kilo 응답(OpenAI)을 Anthropic으로 역변환
-        try {
-          const j = JSON.parse(t);
-          const choice = j.choices?.[0]; const msg = choice?.message || {};
-          const contentBlocks = [];
-          if (msg.reasoning_content) contentBlocks.push({ type: 'thinking', thinking: msg.reasoning_content });
-          if (msg.content) contentBlocks.push({ type: 'text', text: msg.content });
-          if (Array.isArray(msg.tool_calls)) for (const tc of msg.tool_calls) { let pi={}; try{pi=JSON.parse(tc.function?.arguments||'{}')}catch{}; contentBlocks.push({ type: 'tool_use', id: tc.id, name: tc.function?.name||'', input: pi }); }
-          const anthRes = { id: j.id?.replace('gen-','msg_') || `msg_${crypto.randomUUID().replace(/-/g,'').slice(0,24)}`, type: 'message', role: 'assistant', model: j.model || upstreamModel, content: contentBlocks.length?contentBlocks:[{type:'text',text:''}], stop_reason: choice?.finish_reason==='tool_calls'?'tool_use':'end_turn', stop_sequence: null, usage: { input_tokens: j.usage?.prompt_tokens||0, output_tokens: j.usage?.completion_tokens||0 } };
-          res.writeHead(kr.status, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify(anthRes));
-        } catch {
-          res.writeHead(kr.status, { 'Content-Type': kr.headers.get('content-type') || 'application/json' });
-          return res.end(t);
-        }
-      } catch (e) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } }));
+        const cj = responsesToChatJson(await mfr.json(), upstreamModel);
+        const choice = (cj.choices && cj.choices[0]) || {};
+        const msg = choice.message || {};
+        const contentBlocks = [];
+        if (msg.reasoning_content) contentBlocks.push({ type: 'thinking', thinking: msg.reasoning_content });
+        if (msg.content) contentBlocks.push({ type: 'text', text: msg.content });
+        const anthRes = {
+          id: cj.id?.replace('chatcmpl-', 'msg_') || `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+          type: 'message', role: 'assistant', model: upstreamModel,
+          content: contentBlocks.length ? contentBlocks : [{ type: 'text', text: '' }],
+          stop_reason: 'end_turn', stop_sequence: null,
+          usage: { input_tokens: cj.usage?.prompt_tokens || 0, output_tokens: cj.usage?.completion_tokens || 0 }
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(anthRes));
       }
-    }
-    // zen (opencode) — 직통 passthrough, 변환 없음
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
-    try {
-      const fr = await fetch(UPSTREAM + '/messages', { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
-      const ct = fr.headers.get('content-type') || 'application/json';
-      if (body.stream && fr.ok) {
-        res.writeHead(200, { 'Content-Type': ct.includes('text/event-stream') ? ct : 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+
+      fetchRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headers, body: JSON.stringify(openReq), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      if (!fetchRes.ok) { const t = await fetchRes.text(); res.writeHead(fetchRes.status, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: t.slice(0, 500) } })); }
+
+      if (body.stream) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
         if (res.flushHeaders) res.flushHeaders();
-        for await (const chunk of fr.body) res.write(chunk);
+        const aw = createAnthropicStreamWriter(c => res.write(c), upstreamModel, 0);
+        await pumpChatSSEToAnthropic(fetchRes.body, aw);
         return res.end();
       }
-      const text = await fr.text();
-      res.writeHead(fr.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
-      return res.end(text);
+
+      const openJson = await fetchRes.json();
+      const choice = (openJson.choices && openJson.choices[0]) || {};
+      const msg = choice.message || {};
+      const contentBlocks = [];
+      if (msg.reasoning_content) contentBlocks.push({ type: 'thinking', thinking: msg.reasoning_content });
+      if (msg.content) contentBlocks.push({ type: 'text', text: msg.content });
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          let parsedInput = {}; try { parsedInput = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+          contentBlocks.push({ type: 'tool_use', id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`, name: tc.function?.name || '', input: parsedInput });
+        }
+      }
+      const anthRes = {
+        id: openJson.id?.replace('gen-', 'msg_') || `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+        type: 'message', role: 'assistant', model: openJson.model || upstreamModel,
+        content: contentBlocks.length ? contentBlocks : [{ type: 'text', text: '' }],
+        stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: openJson.usage?.prompt_tokens || 0, output_tokens: openJson.usage?.completion_tokens || 0 }
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(anthRes));
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: e.message } }));

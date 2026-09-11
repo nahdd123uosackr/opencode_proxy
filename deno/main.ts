@@ -339,6 +339,74 @@ function effortFromClientBody(body) {
   if (body.reasoning && typeof body.reasoning.effort === 'string' && body.reasoning.effort) return body.reasoning.effort;
   return null;
 }
+function estimateTokens(str) { return Math.ceil(String(str || '').length / 4); }
+function totalPromptTokensForMessages(messages, instructions) {
+  let t = 0;
+  if (instructions) t += estimateTokens(instructions);
+  for (const m of messages || []) {
+    t += estimateTokens(JSON.stringify(m.content || '')) + estimateTokens(m.role || '') + 10;
+    if (Array.isArray(m.tool_calls)) for (const tc of m.tool_calls) t += estimateTokens(JSON.stringify(tc)) + 10;
+  }
+  return t;
+}
+function totalPromptTokensForInput(input, instructions) {
+  let t = 0;
+  if (instructions) t += estimateTokens(instructions);
+  for (const it of input || []) {
+    if (it.role) t += estimateTokens(JSON.stringify(it.content || '')) + 10;
+    else if (it.type === 'function_call' || it.type === 'function_call_output') t += estimateTokens(JSON.stringify(it)) + 10;
+    else t += estimateTokens(JSON.stringify(it)) + 10;
+  }
+  return t;
+}
+function truncateMessagesIfNeeded(messages, instructions, maxTokens) {
+  const MAX = maxTokens || parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  if (!Array.isArray(messages) || !messages.length) return messages;
+  let total = totalPromptTokensForMessages(messages, instructions);
+  if (total <= MAX) return messages;
+  const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
+  const otherMsgs = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
+  const keptOther = [];
+  let keptTokens = totalPromptTokensForMessages(systemMsgs, instructions);
+  for (let i = otherMsgs.length - 1; i >= 0; i--) {
+    const cand = otherMsgs[i];
+    const candTokens = estimateTokens(JSON.stringify(cand.content || '')) + 10 + (Array.isArray(cand.tool_calls) ? estimateTokens(JSON.stringify(cand.tool_calls)) : 0);
+    if (keptTokens + candTokens > MAX) {
+      if (cand.role === 'tool') {
+        const hasPair = keptOther.some(k => k.role === 'assistant' && Array.isArray(k.tool_calls) && k.tool_calls.some(tc => tc.id === cand.tool_call_id));
+        if (!hasPair) continue;
+      }
+      if (keptTokens + candTokens > MAX) continue;
+    }
+    keptOther.unshift(cand);
+    keptTokens += candTokens;
+    if (keptTokens >= MAX) break;
+  }
+  const truncated = [...systemMsgs, ...keptOther];
+  console.log(`[truncate] messages ${messages.length}→${truncated.length} tokens ${total}→${keptTokens} (max ${MAX})`);
+  return truncated;
+}
+function truncateInputIfNeeded(input, instructions, maxTokens) {
+  const MAX = maxTokens || parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  if (!Array.isArray(input) || !input.length) return input;
+  let total = totalPromptTokensForInput(input, instructions);
+  if (total <= MAX) return input;
+  const devItems = input.filter(it => it.role === 'developer');
+  const otherItems = input.filter(it => it.role !== 'developer');
+  const keptOther = [];
+  let keptTokens = totalPromptTokensForInput(devItems, instructions);
+  for (let i = otherItems.length - 1; i >= 0; i--) {
+    const cand = otherItems[i];
+    const candTokens = estimateTokens(JSON.stringify(cand)) + 10;
+    if (keptTokens + candTokens > MAX) continue;
+    keptOther.unshift(cand);
+    keptTokens += candTokens;
+  }
+  const truncated = [...devItems, ...keptOther];
+  console.log(`[truncate] input ${input.length}→${truncated.length} tokens ${total}→${keptTokens} (max ${MAX})`);
+  return truncated;
+}
+
 function effortFromThinking(thinking) {
   if (!thinking || thinking.type !== 'enabled') return null;
   const bt = Number(thinking.budget_tokens) || 0;
@@ -461,6 +529,9 @@ export default {
     const { upstreamModel, variant: rawVariant } = parseModel(body.model);
     const isMuse = /muse/i.test(upstreamModel);
     const isStream = !!body.stream;
+    // 대형 프롬프트 빈 choices 방지 — chat/responses 공용 트렁케이트 (messages는 변환 후 별도)
+    if (Array.isArray(body.messages)) body.messages = truncateMessagesIfNeeded(body.messages, body.instructions || body.system);
+    if (Array.isArray(body.input)) body.input = truncateInputIfNeeded(body.input, body.instructions);
     // P23: 콜론 접미사가 최우선, 없으면 thinking -> reasoning_effort/reasoning.effort 순.
     const variant = rawVariant || effortFromThinking(body.thinking) || effortFromClientBody(body);
 
@@ -548,7 +619,8 @@ export default {
       }
 
       if (pathname === '/v1/messages') {
-        const anthMessages = anthropicMessagesToOpenAI(body);
+        let anthMessages = anthropicMessagesToOpenAI(body);
+        anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
         const anthTools = anthropicToolsToOpenAI(body.tools);
         const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
         const openReq = { model: upstreamModel, messages: anthMessages, max_tokens: body.max_tokens, temperature: body.temperature, top_p: body.top_p, stream: !!body.stream, stop: body.stop_sequences, ...(anthTools?{tools:anthTools}:{}), ...(anthToolChoice?{tool_choice:anthToolChoice}:{}) };

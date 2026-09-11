@@ -181,6 +181,93 @@ function applyMinTokens(body) {
   return body;
 }
 
+// 2) 대형 프롬프트(191k→141k 압축 후에도 대형) 빈 choices 방지 — 입력 히스토리 트렁케이트
+// muse-spark 컨텍스트 1M, output 131k 강제 시 프롬프트가 700k 토큰을 넘으면
+// 남은 출력 여유가 좁아지며 upstream이 reasoning만 125B로 끊고 content:null 빈 choices로 200 반환.
+// 프롬프트 토큰을 700k(≈2.8M chars) 이하로 유지하도록 오래된 히스토리부터 잘라냄.
+// system/developer 메시지는 보존, tool 히스토리는 call_id 매칭을 유지하기 위해
+// tool_result는 대응되는 assistant tool_calls와 함께 보존/삭제.
+function estimateTokens(str) {
+  return Math.ceil(String(str || '').length / 4);
+}
+function totalPromptTokensForMessages(messages, instructions) {
+  let t = 0;
+  if (instructions) t += estimateTokens(instructions);
+  for (const m of messages || []) {
+    t += estimateTokens(JSON.stringify(m.content || '')) + estimateTokens(m.role || '') + 10;
+    if (Array.isArray(m.tool_calls)) for (const tc of m.tool_calls) t += estimateTokens(JSON.stringify(tc)) + 10;
+  }
+  return t;
+}
+function totalPromptTokensForInput(input, instructions) {
+  let t = 0;
+  if (instructions) t += estimateTokens(instructions);
+  for (const it of input || []) {
+    if (it.role) t += estimateTokens(JSON.stringify(it.content || '')) + 10;
+    else if (it.type === 'function_call' || it.type === 'function_call_output') t += estimateTokens(JSON.stringify(it)) + 10;
+    else t += estimateTokens(JSON.stringify(it)) + 10;
+  }
+  return t;
+}
+function truncateMessagesIfNeeded(messages, instructions, maxTokens) {
+  const MAX = maxTokens || parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  if (!Array.isArray(messages) || !messages.length) return messages;
+  let total = totalPromptTokensForMessages(messages, instructions);
+  if (total <= MAX) return messages;
+  // system/developer는 보존, 나머지는 오래된 것부터 제거 (tool_result는 짝을 맞춰 제거)
+  const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
+  const otherMsgs = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
+  // 뒤에서부터(최신이 중요) 누적
+  const keptOther = [];
+  let keptTokens = totalPromptTokensForMessages(systemMsgs, instructions);
+  for (let i = otherMsgs.length - 1; i >= 0; i--) {
+    const cand = otherMsgs[i];
+    const candTokens = estimateTokens(JSON.stringify(cand.content || '')) + 10 + (Array.isArray(cand.tool_calls) ? estimateTokens(JSON.stringify(cand.tool_calls)) : 0);
+    if (keptTokens + candTokens > MAX) {
+      // tool_result 단독으로 남으면 짝이 깨지므로, 대응 assistant tool_calls가 없으면 스킵
+      if (cand.role === 'tool') {
+        // tool_result만 남고 assistant가 잘렸으면 의미 없으니 스킵
+        const hasPair = keptOther.some(k => k.role === 'assistant' && Array.isArray(k.tool_calls) && k.tool_calls.some(tc => tc.id === cand.tool_call_id));
+        if (!hasPair) continue;
+      }
+      if (cand.role === 'assistant' && Array.isArray(cand.tool_calls)) {
+        // assistant tool_calls만 남고 뒤에 tool_result가 없으면 잘라냄
+        const hasResult = keptOther.some(k => k.role === 'tool' && k.tool_call_id && cand.tool_calls.some(tc => tc.id === k.tool_call_id));
+        // 결과 없어도 일단 보존하되, 전체가 너무 크면 계속 잘라야 하므로 일단 스킵하지 않고 계속
+      }
+      // 토큰 초과 시 더 오래된 메시지 스킵
+      if (keptTokens + candTokens > MAX) continue;
+    }
+    keptOther.unshift(cand);
+    keptTokens += candTokens;
+    if (keptTokens >= MAX) break;
+  }
+  const truncated = [...systemMsgs, ...keptOther];
+  console.log(`[truncate] messages ${messages.length}→${truncated.length} tokens ${total}→${keptTokens} (max ${MAX})`);
+  return truncated;
+}
+function truncateInputIfNeeded(input, instructions, maxTokens) {
+  const MAX = maxTokens || parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  if (!Array.isArray(input) || !input.length) return input;
+  let total = totalPromptTokensForInput(input, instructions);
+  if (total <= MAX) return input;
+  // developer role은 보존
+  const devItems = input.filter(it => it.role === 'developer');
+  const otherItems = input.filter(it => it.role !== 'developer');
+  const keptOther = [];
+  let keptTokens = totalPromptTokensForInput(devItems, instructions);
+  for (let i = otherItems.length - 1; i >= 0; i--) {
+    const cand = otherItems[i];
+    const candTokens = estimateTokens(JSON.stringify(cand)) + 10;
+    if (keptTokens + candTokens > MAX) continue;
+    keptOther.unshift(cand);
+    keptTokens += candTokens;
+  }
+  const truncated = [...devItems, ...keptOther];
+  console.log(`[truncate] input ${input.length}→${truncated.length} tokens ${total}→${keptTokens} (max ${MAX})`);
+  return truncated;
+}
+
 function applyMuseDefaults(body, api) {
   if (/muse/i.test(String(body.model || ''))) {
     const reqMax = Math.max(body.max_tokens || 0, body.max_output_tokens || 0);
@@ -944,6 +1031,9 @@ const handle = async (req, res) => {
     // P23: 콜론 접미사 없이 reasoning_effort/reasoning.effort로 effort를 보낸
     // 클라이언트(OpenAI 호환 SDK 등)도 museViaResponses가 그 값을 쓰도록 한다.
     const effectiveVariant = variant || effortFromClientBody(body);
+    // 대형 프롬프트 빈 choices 방지 — 700k 토큰 초과 시 오래된 히스토리 트렁케이트
+    if (Array.isArray(body.messages)) body.messages = truncateMessagesIfNeeded(body.messages, body.instructions || body.system);
+    if (Array.isArray(body.input)) body.input = truncateInputIfNeeded(body.input, body.instructions);
     let ub = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) ub.metadata = Object.assign({}, ub.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
     if (!/muse/i.test(upstreamModel)) ub = applyVariant(ub, effectiveVariant);
@@ -1027,7 +1117,9 @@ const handle = async (req, res) => {
     // muse-spark 경로에서 통째로 무시됐다.
     const effectiveVariant = variant || effortFromThinking(body.thinking) || effortFromClientBody(body);
     // P21: Anthropic → OpenAI 정규화 (system/tool/image/tool_result)
-    const anthMessages = anthropicMessagesToOpenAI(body);
+    let anthMessages = anthropicMessagesToOpenAI(body);
+    // 대형 프롬프트 빈 choices 방지
+    anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
     const anthTools = anthropicToolsToOpenAI(body.tools);
     const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
     let openReq = {
@@ -1128,6 +1220,8 @@ const handle = async (req, res) => {
     // 콜론 접미사도 없고 nested reasoning도 없이 flat reasoning_effort만 보내는
     // 클라이언트를 위한 폴백.
     const effectiveVariant = variant || (body.reasoning ? null : effortFromClientBody(body));
+    // 대형 프롬프트 빈 choices 방지
+    if (Array.isArray(body.input)) body.input = truncateInputIfNeeded(body.input, body.instructions);
     let upstreamBody = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) {
       upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });

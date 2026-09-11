@@ -531,8 +531,20 @@ export default {
       if (!pbody.model) return json({ error: { message: 'model required' } }, 400);
       const isStream = !!pbody.stream;
       const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+      // zen은 tools[].type: "image_generation"을 아예 지원하지 않아 항상 400 [invalid_request_error]
+      // Unsupported tool type을 낸다. CLIProxyAPI의 codex 실행기가 muse-spark 계열 /responses 호출에
+      // 이 tool을 기본으로 자동 주입해서 발생(클라이언트가 직접 보낸 tools엔 없음) — 순수 passthrough
+      // 원칙은 유지하되, 이 tool 타입이 섞여 있을 때만 그것만 제거하고 나머지 바디는 그대로 둔다.
+      let outText = rawText;
+      if (pathname === '/res/v1/responses' && Array.isArray(pbody.tools) && pbody.tools.some((t) => t && t.type === 'image_generation')) {
+        const filtered = pbody.tools.filter((t) => !(t && t.type === 'image_generation'));
+        const patched = { ...pbody, tools: filtered };
+        if (!filtered.length) delete patched.tools;
+        outText = JSON.stringify(patched);
+        console.warn('[compat] /res/v1/responses: stripped unsupported image_generation tool before forwarding to zen');
+      }
       try {
-        const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: rawText });
+        const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: outText });
         const ct = fr.headers.get('content-type') || 'application/json';
         if (isStream && ct.includes('text/event-stream')) {
           return new Response(fr.body, { status: fr.status, headers: { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });

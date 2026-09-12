@@ -117,7 +117,7 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
   `framework`가 `node`로 오감지돼 `vercel.json`의 서버리스 라우팅이 무시되고 **모든 요청이
   404**로 죽는다(P16). `redeploy.sh`는 매 배포마다 자동으로 이 PATCH를 건다.
 
-## 6. 문제 해결 이력 요약 (P0~P28, 상세는 `문제_해결.md`)
+## 6. 문제 해결 이력 요약 (P0~P30, 상세는 `문제_해결.md`)
 
 | # | 증상 | 원인 한 줄 |
 |---|---|---|
@@ -143,6 +143,8 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
 | P26 | Kilo 키가 `/res|chat|mes/*`에서 무시됨 | 버그 아님 — 이 라우트군은 애초에 zen 전용(Kilo 분기 없음) 설계. `/kilo/v1/models`+`/kilo/v1/chat/completions` 전용 라우트 신설로 해결 |
 | P27 | OmniRoute `mycli` 경유 muse-spark `/chat/completions` 504(30s hang) | CLIProxyAPI `openai-compatibility`(opencode-chat/opencode-zen1-chat) 목록에 muse-spark가 `codex-api-key`와 중복 등록 → chat 쪽 목록에서 제거, 부수적으로 CLIProxyAPI가 kill 후 자동 재기동 안 됨을 발견해 수동 기동 |
 | P28 | `/res/v1/responses`에 작은 `max_output_tokens`로 muse 호출 시 502 empty stream(pool 47개 노드 전부 동일 실패) | muse가 reasoning으로 예산을 먼저 소모해 `output:[]`로 "성공"(200) 종료 → 레거시의 131072 하한(`applyMuseDefaults`)이 신규 passthrough엔 없었음 → muse일 때만 동일 하한 추가 |
+| P29 | CLIProxyAPI config.yaml의 openproxy 관련 provider 전부 소실(codex-api-key/claude-api-key 섹션째로, bifrost provider DB도 함께) | 원인 미상(pod 재시작은 아님, 살아있는 pod 안에서 되돌려짐) → pod 내 P27/P28 작업 중 남은 타임스탬프 백업(`pre-muse-chat-removal`/`pre-cleanup-old-providers`)에서 Python으로 실키 재조합해 복구 |
+| P30 | `/res|chat|mes/v1/models`가 프로토콜 무관 동일 무료 목록 반환(이름 패턴만으론 qwen/gemini 오분류) | zen 공식 문서(`zen.mdx` "Endpoints" 표, GitHub `anomalyco/opencode`)를 fetch해서 모델→포맷 맵 동적 생성, 문서에 없는 모델만 이름 패턴 폴백 — zen 서버 소스(`packages/console/.../zen/util/handler.ts`)에서 `formatFilter` 불일치 시 하드 거부(`ModelError`)함을 교차 확인 |
 
 **교훈 총정리(반복해서 나온 것들)**:
 1. 헬스 프로브 성공 ≠ 실제 요청 경로 정상. 회귀 검증은 항상 클라이언트가 실제로 때리는 엔드포인트로.

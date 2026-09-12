@@ -272,3 +272,21 @@ OmniRoute에 정상 등록된 또 다른 provider `openprox-res`(`base_url: .../
 소진되고 `output:[]`인 채로 HTTP 200 "성공"한다 — 레거시 변환 경로가 강제하던 `max_output_tokens ≥
 131072` 하한이 이 순수 passthrough 경로엔 없어서 재발. 동일 하한을 muse 모델일 때만 추가해 해결(P24의
 image_generation 필터와 같은 성격의 최소 예외). 상세: `문제_해결.md` P28.
+
+### `GET /res|chat|mes/v1/models`가 프로토콜과 무관하게 동일한 무료 목록 반환 (P30, 2026-09-12)
+
+이 문서 §"새 라우트 3개"의 원래 설계 의도는 res→responses 전용/chat→chat/completions 전용/mes→messages
+전용 모델만 노출하는 것이었는데, 실제 구현(P25)은 유료 필터만 추가하고 프로토콜별 필터링 자체를 빼먹어서
+세 라우트가 전부 동일한 무료 목록을 반환하고 있었다. 처음엔 "claude-*=messages, muse-spark*=responses,
+나머지=chat" 이름 패턴으로 고치려 했는데, opencode 공식 저장소(`anomalyco/opencode`)의
+`packages/web/src/content/docs/zen.mdx`("Endpoints" 표)와 zen 게이트웨이 서버 소스
+(`packages/console/app/src/routes/zen/`)를 직접 대조해보니 **qwen***도 messages 전용이고 **gemini-***는
+셋 중 어디에도 안 속하는 완전히 다른 포맷(`/v1/models/{id}`, Google 네이티브)이었다 — zen 서버가
+`ModelError: modelFormatNotSupported`로 모델↔포맷 불일치를 하드 게이트한다는 것까지 코드로 확인했다(이
+문서 §"CLIProxyAPI" 섹션에서 설명한 "모델별로 실제 동작하는 엔드포인트가 다르다"는 전제가 zen 쪽에서도
+프로토콜 레벨로 강제되고 있다는 뜻).
+
+수정은 zen.mdx를 fetch해서 "Endpoints" 표를 파싱해 모델→포맷 맵을 만들고(6시간 캐시), 문서에 없는 신규
+모델만 기존 이름 패턴으로 폴백하는 방식(`getZenEndpointMap()`/`classifyZenModelProtocol()`). qwen/gemini는
+전부 유료 전용이라 이 오분류가 실사용 경로(무료 목록)엔 영향이 없었음을 확인 — 수정 전후 실제 출력은
+동일. 상세: `문제_해결.md` P30.

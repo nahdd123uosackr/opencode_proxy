@@ -132,6 +132,68 @@ async function getKiloFreeModels() {
   return kiloModelsCache || [];
 }
 
+// === UncloseAI 프로바이더 (완전 무인증, OmniRoute registry authType:"optional"로 확인) ===
+// 클라이언트가 어떤 키를 보내든(zen/kilo/없음) 무관하게 항상 사용 가능 — 업스트림이 키 자체를
+// 요구하지 않는다(2026-09-12 실측: 키 없이 /v1/models·/v1/chat/completions 둘 다 200).
+const UNCLOSEAI_BASE = 'https://hermes.ai.unturf.com';
+let uncloseaiModelsCache = null;
+let uncloseaiModelsCacheTime = 0;
+async function getUncloseaiModels() {
+  const now = Date.now();
+  if (uncloseaiModelsCache && (now - uncloseaiModelsCacheTime) < 300000) return uncloseaiModelsCache;
+  try {
+    const r = await fetch(UNCLOSEAI_BASE + '/v1/models', { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const nowSec = Math.floor(now / 1000);
+    const list = (j.data || []).filter((m) => m && m.id).map((m) => ({ id: 'uncloseai/' + m.id, object: 'model', created: nowSec, owned_by: 'uncloseai' }));
+    uncloseaiModelsCache = list; uncloseaiModelsCacheTime = now;
+  } catch (e) { console.error('[uncloseai models] fail', String(e).slice(0, 80)); }
+  return uncloseaiModelsCache || [];
+}
+
+// === Dahl 프로바이더 (managedAccount — 우리 프록시가 직접 토큰을 자체 발급/관리) ===
+// dahl은 키를 미리 등록해두는 방식이 아니라, 아무 인증 없이 POST /tokens 한 번이면
+// 즉시 토큰이 발급된다(가입/이메일 불필요, 2026-09-12 실측: available_tokens는 발급마다
+// 동일한 100000000 고정값 — 실사용량 추적용이 아니라 사실상 무제한 표시로 보임). 그래서
+// 각 노드(Vercel/Deno/로컬 인스턴스 하나하나)가 부팅 후 처음 요청이 왔을 때 스스로 토큰을
+// 발급받아 메모리에 캐시해두면 되고, 우리 쪽에서 API 키를 미리 발급받아 env로 배포할 필요가
+// 전혀 없다 — 노드가 완전히 자체관리한다. 토큰이 (아직 관찰되진 않았지만) 언젠가 무효화될
+// 경우를 대비해, 실제 호출이 401/403을 받으면 캐시를 비우고 1회 재발급 후 재시도한다.
+const DAHL_BASE = 'https://inference.dahl.global';
+let dahlTokenCache = null;
+let dahlTokenCacheTime = 0;
+let dahlModelsCache = null;
+let dahlModelsCacheTime = 0;
+const DAHL_TOKEN_TTL = 6 * 60 * 60 * 1000; // 만료 정책이 불명이라 보수적으로 6시간마다 갱신
+async function mintDahlToken() {
+  const r = await fetch(DAHL_BASE + '/tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error('dahl token mint failed: HTTP ' + r.status);
+  const j = await r.json();
+  if (!j.token) throw new Error('dahl token mint returned no token');
+  return j.token;
+}
+async function getDahlToken(forceNew) {
+  const now = Date.now();
+  if (!forceNew && dahlTokenCache && (now - dahlTokenCacheTime) < DAHL_TOKEN_TTL) return dahlTokenCache;
+  const token = await mintDahlToken();
+  dahlTokenCache = token; dahlTokenCacheTime = now;
+  return token;
+}
+async function getDahlModels() {
+  const now = Date.now();
+  if (dahlModelsCache && (now - dahlModelsCacheTime) < 300000) return dahlModelsCache;
+  try {
+    const r = await fetch(DAHL_BASE + '/v1/models', { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const nowSec = Math.floor(now / 1000);
+    const list = (j.data || []).filter((m) => m && m.id).map((m) => ({ id: 'dahl/' + m.id, object: 'model', created: nowSec, owned_by: 'dahl' }));
+    dahlModelsCache = list; dahlModelsCacheTime = now;
+  } catch (e) { console.error('[dahl models] fail', String(e).slice(0, 80)); }
+  return dahlModelsCache || [];
+}
+
 async function getFreeModelsExpanded() {
   const now = Date.now();
   if (modelsCache && (now - modelsCacheTime) < MODELS_TTL) return modelsCache;
@@ -687,7 +749,11 @@ export default {
     if (request.method === 'GET' && pathname === '/v1/models') {
       try {
         let data = await getFreeModelsExpanded();
-        try { data = data.concat(await getKiloFreeModels()); data.sort((a, b) => a.id.localeCompare(b.id)); } catch {}
+        try { data = data.concat(await getKiloFreeModels()); } catch {}
+        // uncloseai/dahl은 kilo/zen 키 체계와 무관하게 항상 무인증으로 동작하므로 항상 추가한다.
+        try { data = data.concat(await getUncloseaiModels()); } catch {}
+        try { data = data.concat(await getDahlModels()); } catch {}
+        data.sort((a, b) => a.id.localeCompare(b.id));
         return json({ object: 'list', data });
       } catch (e) { return json({ error: { message: e.message } }, 500); }
     }
@@ -740,6 +806,27 @@ export default {
           return new Response(kr.body, { status: 200, headers: { ...CORS, 'Content-Type': kr.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' } });
         }
         return new Response(await kr.text(), { status: kr.status, headers: { ...CORS, 'Content-Type': kr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' } });
+      }
+      // === UncloseAI/Dahl 모델 (uncloseai/, dahl/ 접두사) — kilo/zen 키 체계와 완전
+      // 무관하게 직접 포워드. 클라이언트가 보낸 Authorization은 무시하고 각 업스트림에
+      // 맞는 인증을 여기서 직접 구성한다(uncloseai는 무인증, dahl은 우리가 자체 발급한 토큰). ===
+      if (/^(uncloseai|dahl)\//i.test(String(body.model || ''))) {
+        const isDahl = /^dahl\//i.test(String(body.model || ''));
+        const realModel = String(body.model).replace(/^(uncloseai|dahl)\//i, '');
+        const upstreamBase = isDahl ? DAHL_BASE : UNCLOSEAI_BASE;
+        const uHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
+        let ur;
+        for (let attempt = 0; attempt < (isDahl ? 2 : 1); attempt++) {
+          if (isDahl) uHeaders.Authorization = `Bearer ${await getDahlToken(attempt > 0)}`;
+          ur = await fetch(upstreamBase + '/v1/chat/completions', { method: 'POST', headers: uHeaders, body: JSON.stringify({ ...body, model: realModel }) });
+          // dahl 토큰이 (관찰된 적은 없지만) 무효화됐을 가능성에 대비: 인증 실패면 재발급 1회 재시도
+          if (isDahl && (ur.status === 401 || ur.status === 403) && attempt === 0) continue;
+          break;
+        }
+        if (isStream && ur.ok) {
+          return new Response(ur.body, { status: 200, headers: { ...CORS, 'Content-Type': ur.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' } });
+        }
+        return new Response(await ur.text(), { status: ur.status, headers: { ...CORS, 'Content-Type': ur.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' } });
       }
       if (pathname === '/v1/chat/completions') {
         // fix400 v2 (2026-08-26): Responses 형식 요청 처리

@@ -995,7 +995,7 @@ const handle = async (req, res) => {
     }
   }
 
-  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/');
+  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/') || pathname.startsWith('/uncloseai/') || pathname.startsWith('/dahl/');
   if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid API key' } }));
@@ -1610,6 +1610,91 @@ const handle = async (req, res) => {
         return res.end();
       }
       return res.end(await kr.text());
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  // /kilo/v1과 같은 원칙(네이티브 엔드포인트, 접두사 없는 모델명)의 UncloseAI/Dahl 전용 라우트.
+  // 레거시 /v1/models·/v1/chat/completions의 uncloseai/·dahl/ 접두사 라우팅과 별개로,
+  // 클라이언트가 그 프로바이더만 쓰고 싶을 때 접두사 없이 바로 부를 수 있게 한다.
+  if (pathname === '/uncloseai/v1/models') {
+    try {
+      const models = await getUncloseaiModels();
+      const data = models.map(m => ({ ...m, id: m.id.replace(/^uncloseai\//, '') }));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ object: 'list', data }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  if (pathname === '/dahl/v1/models') {
+    try {
+      const models = await getDahlModels();
+      const data = models.map(m => ({ ...m, id: m.id.replace(/^dahl\//, '') }));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ object: 'list', data }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  if (req.method === 'POST' && pathname === '/uncloseai/v1/chat/completions') {
+    const rawBody = Buffer.concat(chunks).toString('utf-8');
+    let body; try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'Invalid JSON' } })); }
+    if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
+    const realModel = String(body.model).replace(/^uncloseai\//i, ''); // kilo/v1과 동일하게 접두사 방어적 스트립
+    const isStream = !!body.stream;
+    const uHeaders = { 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' };
+    try {
+      const ur = await fetch(UNCLOSEAI_BASE + '/v1/chat/completions', {
+        method: 'POST', headers: uHeaders, body: JSON.stringify({ ...body, model: realModel }),
+        signal: AbortSignal.timeout(parseInt(process.env.UNCLOSEAI_DAHL_TIMEOUT_MS || '120000', 10)),
+      });
+      const ct = ur.headers.get('content-type') || 'application/json';
+      res.writeHead(ur.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+      if (isStream && ur.body && ct.includes('text/event-stream')) {
+        const reader = ur.body.getReader(); const dec = new TextDecoder();
+        try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(dec.decode(value, { stream: true })); } } catch {}
+        return res.end();
+      }
+      return res.end(await ur.text());
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  if (req.method === 'POST' && pathname === '/dahl/v1/chat/completions') {
+    const rawBody = Buffer.concat(chunks).toString('utf-8');
+    let body; try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'Invalid JSON' } })); }
+    if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
+    const realModel = String(body.model).replace(/^dahl\//i, '');
+    const isStream = !!body.stream;
+    const dHeaders = { 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' };
+    try {
+      let dr;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        dHeaders['Authorization'] = `Bearer ${await getDahlToken(attempt > 0)}`;
+        dr = await fetch(DAHL_BASE + '/v1/chat/completions', {
+          method: 'POST', headers: dHeaders, body: JSON.stringify({ ...body, model: realModel }),
+          signal: AbortSignal.timeout(parseInt(process.env.UNCLOSEAI_DAHL_TIMEOUT_MS || '120000', 10)),
+        });
+        if ((dr.status === 401 || dr.status === 403) && attempt === 0) continue;
+        break;
+      }
+      const ct = dr.headers.get('content-type') || 'application/json';
+      res.writeHead(dr.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+      if (isStream && dr.body && ct.includes('text/event-stream')) {
+        const reader = dr.body.getReader(); const dec = new TextDecoder();
+        try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(dec.decode(value, { stream: true })); } } catch {}
+        return res.end();
+      }
+      return res.end(await dr.text());
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: e.message } }));

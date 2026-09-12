@@ -712,6 +712,58 @@ async function pumpResponsesSSEToAnthropic(body, aw) {
 }
 
 const KNOWN_FREE_EXTRA = new Set(['big-pickle', 'grok-code']);
+// P29/P30 (2026-09-12): zen /models 응답 자체엔 엔드포인트 호환성 메타데이터가 없다(id/object/created/
+// owned_by뿐). 처음엔 "claude-*=messages, muse-spark*=responses, 나머지=chat" 이름 패턴으로 분류했는데,
+// opencode 공식 문서(zen.mdx의 "Endpoints" 표)를 실제로 대조해보니 qwen*도 messages 전용이고 gemini-*는
+// 셋 중 어디에도 안 속하는 별도 포맷(`/v1/models/{id}`, Google 네이티브)이었다 — 이 프로젝트가 가진 키는
+// 전부 무결제라 qwen/gemini(둘 다 유료 전용, free 버전 없음)는 애초에 무료 필터에서 걸러져 이 오분류가
+// 실사용엔 영향 없었지만, 정확한 근거로 바꾼다. zen.mdx 원본(마크다운 파이프 테이블, JS 렌더링 불필요)을
+// fetch해서 파싱하고, 표에 없는 새 모델(문서가 API보다 며칠 뒤처질 수 있음 — 실제로 이 표엔
+// muse-spark-1.2-contributor-free/deepseek-v4-flash-free가 빠져 있었다)에 한해서만 기존 이름 패턴
+// 휴리스틱으로 폴백한다. 문서 fetch/파싱 자체가 실패하면 전부 휴리스틱으로 폴백.
+const ZEN_DOCS_URL = 'https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx';
+const ZEN_ENDPOINT_MAP_TTL = 6 * 60 * 60 * 1000; // 문서는 자주 안 바뀌므로 6시간
+let zenEndpointMapCache = null, zenEndpointMapCacheTime = 0;
+
+async function getZenEndpointMap() {
+  const now = Date.now();
+  if (zenEndpointMapCache && (now - zenEndpointMapCacheTime) < ZEN_ENDPOINT_MAP_TTL) return zenEndpointMapCache;
+  try {
+    const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
+    const text = await r.text();
+    const m = text.match(/## Endpoints\n[\s\S]*?\n\| *Model[^\n]*\n\|[-\s|]+\n([\s\S]*?)\n\n/);
+    if (!m) throw new Error('endpoint table not found in zen.mdx (markup changed?)');
+    const map = {};
+    for (const line of m[1].split('\n')) {
+      const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+      if (cells.length < 3 || !cells[1]) continue;
+      const id = cells[1];
+      const endpointUrl = cells[2].replace(/`/g, '');
+      if (endpointUrl.endsWith('/v1/responses')) map[id] = 'responses';
+      else if (endpointUrl.endsWith('/v1/chat/completions')) map[id] = 'chat';
+      else if (endpointUrl.endsWith('/v1/messages')) map[id] = 'messages';
+      else if (/\/v1\/models\//.test(endpointUrl)) map[id] = 'gemini-native';
+    }
+    if (Object.keys(map).length < 10) throw new Error('parsed suspiciously few rows (' + Object.keys(map).length + ')');
+    zenEndpointMapCache = map;
+    zenEndpointMapCacheTime = now;
+    return map;
+  } catch (e) {
+    console.warn('[zen-endpoint-map] fetch/parse failed, falling back to name-pattern heuristic for all models:', e.message);
+    return null;
+  }
+}
+
+const MUSE_MODEL_RE = /^muse-spark/i;
+const CLAUDE_MODEL_RE = /^claude-/i;
+function classifyZenModelProtocol(id, endpointMap) {
+  const fromDocs = endpointMap && endpointMap[id];
+  if (fromDocs) return fromDocs;
+  if (MUSE_MODEL_RE.test(id)) return 'responses';
+  if (CLAUDE_MODEL_RE.test(id)) return 'messages';
+  return 'chat';
+}
 let modelsCache = null, modelsCacheTime = 0;
 const MODELS_TTL = 60 * 60 * 1000;
 
@@ -1305,9 +1357,20 @@ const handle = async (req, res) => {
       // 나머지 프록시 전체가 무료 모델만 노출하는 것과 맞춰(getFreeModelsExpanded와 동일 기준),
       // 이 native passthrough GET /models도 응답 바디에서 유료 모델을 걸러내고 반환한다. id는
       // CLIProxyAPI 등이 그대로 참조하는 zen 네이티브 id라 opencode/ 접두사는 붙이지 않는다.
+      // P29/P30: 추가로 이 경로가 실제 지원하는 프로토콜에 맞는 모델만 남긴다(res→responses 전용,
+      // mes→messages 전용, chat→chat/completions 전용) — 안 그러면 세 라우트가 전부 동일한 전체
+      // 목록을 반환해서 클라이언트가 실제로 동작 안 하는 엔드포인트의 모델을 골라버리는 문제가 있었다.
+      // 분류는 zen 공식 문서(zen.mdx)에서 동적으로 가져오고, 문서에 없는 모델만 이름 패턴으로 폴백한다.
+      const endpointMap = await getZenEndpointMap();
       const upstreamJson = await fr.json();
       const filtered = Array.isArray(upstreamJson.data)
-        ? upstreamJson.data.filter(m => m && m.id && (m.id.endsWith('-free') || KNOWN_FREE_EXTRA.has(m.id)))
+        ? upstreamJson.data.filter(m => {
+            if (!m || !m.id || !(m.id.endsWith('-free') || KNOWN_FREE_EXTRA.has(m.id))) return false;
+            const proto = classifyZenModelProtocol(m.id, endpointMap);
+            if (pathname === '/res/v1/models') return proto === 'responses';
+            if (pathname === '/mes/v1/models') return proto === 'messages';
+            return proto === 'chat'; // /chat/v1/models — gemini-native/unknown은 어느 라우트에도 안 냄
+          })
         : [];
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(JSON.stringify({ ...upstreamJson, data: filtered }));

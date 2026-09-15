@@ -443,6 +443,70 @@ function anthropicToolChoiceToOpenAI(tc) {
   return tc;
 }
 
+// P31 fix (2026-09-15): api/index.js와 동일 로직 이식 — Anthropic Messages API는
+// tool JSON Schema 중첩 깊이가 10을 넘으면 `[invalid_request_error] JSON schema
+// exceeds the maximum nesting depth of 10 levels`로 400을 낸다. MCP 도구가 많은
+// 클라이언트의 깊게 중첩된 parameters/input_schema가 그대로 forward되어 발생.
+// image_generation tool 제거(P24)와 같은 철학으로, 거부 대신 depth 초과 분기를
+// 허용 가능한 leaf({type,description,enum}만)로 잘라낸다.
+function schemaChildNodes(node) {
+  const out = [];
+  if (node.properties && typeof node.properties === 'object') out.push(...Object.values(node.properties));
+  if (node.items) out.push(...(Array.isArray(node.items) ? node.items : [node.items]));
+  if (node.additionalProperties && typeof node.additionalProperties === 'object') out.push(node.additionalProperties);
+  if (node.patternProperties && typeof node.patternProperties === 'object') out.push(...Object.values(node.patternProperties));
+  for (const key of ['anyOf', 'oneOf', 'allOf']) if (Array.isArray(node[key])) out.push(...node[key]);
+  return out;
+}
+function capSchemaDepth(node, maxDepth, depth) {
+  depth = depth || 1;
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+  if (depth >= maxDepth) {
+    const leaf = {};
+    if (node.type) leaf.type = node.type;
+    if (node.description) leaf.description = node.description;
+    if (node.enum) leaf.enum = node.enum;
+    return leaf;
+  }
+  const out = { ...node };
+  if (node.properties && typeof node.properties === 'object') {
+    out.properties = {};
+    for (const [k, v] of Object.entries(node.properties)) out.properties[k] = capSchemaDepth(v, maxDepth, depth + 1);
+  }
+  if (node.items) {
+    out.items = Array.isArray(node.items)
+      ? node.items.map(it => capSchemaDepth(it, maxDepth, depth + 1))
+      : capSchemaDepth(node.items, maxDepth, depth + 1);
+  }
+  if (node.additionalProperties && typeof node.additionalProperties === 'object') {
+    out.additionalProperties = capSchemaDepth(node.additionalProperties, maxDepth, depth + 1);
+  }
+  if (node.patternProperties && typeof node.patternProperties === 'object') {
+    out.patternProperties = {};
+    for (const [k, v] of Object.entries(node.patternProperties)) out.patternProperties[k] = capSchemaDepth(v, maxDepth, depth + 1);
+  }
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(node[key])) out[key] = node[key].map(s => capSchemaDepth(s, maxDepth, depth + 1));
+  }
+  return out;
+}
+const MAX_TOOL_SCHEMA_DEPTH = parseInt(process.env.MAX_TOOL_SCHEMA_DEPTH || '9', 10);
+function capToolSchemaDepth(tool) {
+  if (!tool || typeof tool !== 'object') return tool;
+  const t = { ...tool };
+  if (t.function && typeof t.function === 'object') {
+    t.function = { ...t.function };
+    if (t.function.parameters) t.function.parameters = capSchemaDepth(t.function.parameters, MAX_TOOL_SCHEMA_DEPTH);
+  }
+  if (t.parameters) t.parameters = capSchemaDepth(t.parameters, MAX_TOOL_SCHEMA_DEPTH);
+  if (t.input_schema) t.input_schema = capSchemaDepth(t.input_schema, MAX_TOOL_SCHEMA_DEPTH);
+  return t;
+}
+function capToolsDepth(tools) {
+  if (!Array.isArray(tools)) return tools;
+  return tools.map(capToolSchemaDepth);
+}
+
 const MUSE_EFFORT = { minimal: 'low', low: 'low', medium: 'medium', high: 'high', xhigh: 'high', max: 'high' };
 
 // P23 fix (2026-09-11): 콜론 접미사(":high") 없이 클라이언트가 실제로 보낸
@@ -579,7 +643,7 @@ async function museChatResponse(upstreamModel, bodyObj, variant, isStream) {
   const rbody = {
     model: upstreamModel,
     input: museToInput(bodyObj.messages),
-    tools: (bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean),
+    tools: capToolsDepth((bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean)),
     tool_choice: bodyObj.tool_choice,
     max_output_tokens: Math.max(131072, reqMax || 0),
     store: false,
@@ -682,6 +746,15 @@ export default {
       // 실패하는 두 가지 케이스만 최소 개입으로 방어한다(res/chat/mes 설계 원칙과 같은 성격의 예외, P24/P28):
       let outText = rawText;
       let patched = null;
+      // P31: JSON schema 10-depth 제한은 세 네이티브 라우트 전부에서 발생 가능하므로 공통 처리.
+      if (Array.isArray(pbody.tools)) {
+        const capped = capToolsDepth(pbody.tools);
+        if (JSON.stringify(capped) !== JSON.stringify(pbody.tools)) {
+          patched = patched || { ...pbody };
+          patched.tools = capped;
+          console.warn(`[compat] ${pathname}: capped tool schema nesting depth to ${MAX_TOOL_SCHEMA_DEPTH} before forwarding`);
+        }
+      }
       if (pathname === '/res/v1/responses') {
         // 1) zen은 tools[].type: "image_generation"을 아예 지원하지 않아 항상 400을 낸다. CLIProxyAPI의
         //    codex 실행기가 muse-spark 계열 /responses 호출에 이 tool을 기본으로 자동 주입해서 발생
@@ -913,6 +986,7 @@ export default {
           if (isStream && r2.ok) return new Response(r2.body, { status: 200, headers: { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Cache-Control': 'no-store' } });
           return new Response(await r2.text(), { status: r2.status, headers: { ...CORS, 'Content-Type': r2.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' } });
         }
+        if (Array.isArray(body.tools)) body.tools = capToolsDepth(body.tools);
         if (isMuse) return await museChatResponse(upstreamModel, body, variant, isStream);
         const upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), variant);
         const r = await forward('/chat/completions', upstreamBody, isStream);
@@ -924,6 +998,7 @@ export default {
         // P23 fix: flat reasoning_effort fallback, but avoid duplicate when body already has reasoning object
         // Use rawVariant (colon suffix only) — global variant already includes thinking/clientBody and would bypass the body.reasoning check
         const effectiveVariant = rawVariant || (body.reasoning ? null : effortFromClientBody(body));
+        if (Array.isArray(body.tools)) body.tools = capToolsDepth(body.tools);
         let upstreamBody = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
         if (isMuse) {
           upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
@@ -944,7 +1019,7 @@ export default {
       if (pathname === '/v1/messages') {
         let anthMessages = anthropicMessagesToOpenAI(body);
         anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
-        const anthTools = anthropicToolsToOpenAI(body.tools);
+        const anthTools = capToolsDepth(anthropicToolsToOpenAI(body.tools));
         const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
         const openReq = { model: upstreamModel, messages: anthMessages, max_tokens: body.max_tokens, temperature: body.temperature, top_p: body.top_p, stream: !!body.stream, stop: body.stop_sequences, ...(anthTools?{tools:anthTools}:{}), ...(anthToolChoice?{tool_choice:anthToolChoice}:{}) };
         const full = applyVariant(applyMuseDefaults(openReq, 'chat'), variant);

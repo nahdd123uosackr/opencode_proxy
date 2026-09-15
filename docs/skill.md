@@ -85,6 +85,7 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
   - Kilo Gateway 포워딩(`routeToKilo` 분기): `KILO_BASE + '/chat/completions'`로 클라이언트 요청을 거의 그대로 전달. bifrost가 가끔 `reasoning_effort`와 `reasoning.effort`를 동시에 보내는데 Kilo가 이걸 거부해서(P17), 여기서 방어적으로 구식 필드를 제거함. P23 이후 `responses` muse 분기도 flat 중복 제거로 동일 처리.
   - `isKiloKey`/`isOpenCodeZenKey`/`extractClientKey`: 키 모양(JWT vs `sk-`)으로 provider 식별, 모델 prefix와 불일치하면 400.
   - Circuit breaker(`markKeyFailure`/`isKeyCooling`): 429/402/401 등에 따라 키별로 다른 쿨다운(1분~1시간).
+  - `capSchemaDepth(node, maxDepth, depth)` / `capToolsDepth(tools)`: P31 — Anthropic Messages API가 tool JSON Schema 중첩 깊이 10을 초과하면 400을 내는 것을 방어. `maxDepth`(기본 9, `MAX_TOOL_SCHEMA_DEPTH` env) 초과 분기를 `{type,description,enum}`만 남긴 leaf로 degrade. tools를 다루는 모든 경로(`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, `museViaResponses`/`museChatResponse`, `/res|chat|mes/v1/*` native passthrough)에 적용.
 - **배포되는 곳 (총 50개, 자세한 계정/토큰은 `배포.md` 3절)**:
   - Vercel 38 = **V1 9개**(alias: jet/alpha/seven/rho/six/black/three/theta/two, 실제 프로젝트명은 `vercel-opencode-proxy`) + **V2 9개**(alias: v2/v2-blush/chi/xi/one/omega/snowy/murex/rho, 프로젝트명 `vercel-opencode-proxy-v2`) + **v3 10개** + **v4 10개**(`vercel-opencode-proxy-v3`/`-v4`, CLI 업로드 전용).
     - **중요 발견(2026-09-11)**: V1/V2 18개는 별도 계정이 아니라, v3/v4에 이미 쓰는 **10개 계정이 각자 V1/V2 프로젝트도 이미 갖고 있는 것**이었다. `vercel project ls --token=<토큰>` (⚠️ `--yes` 옵션 없음, 붙이면 즉시 에러)으로 확인 가능. 매핑표는 `배포.md` 3.1.1.
@@ -145,6 +146,7 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
 | P28 | `/res/v1/responses`에 작은 `max_output_tokens`로 muse 호출 시 502 empty stream(pool 47개 노드 전부 동일 실패) | muse가 reasoning으로 예산을 먼저 소모해 `output:[]`로 "성공"(200) 종료 → 레거시의 131072 하한(`applyMuseDefaults`)이 신규 passthrough엔 없었음 → muse일 때만 동일 하한 추가 |
 | P29 | CLIProxyAPI config.yaml의 openproxy 관련 provider 전부 소실(codex-api-key/claude-api-key 섹션째로, bifrost provider DB도 함께) | 원인 미상(pod 재시작은 아님, 살아있는 pod 안에서 되돌려짐) → pod 내 P27/P28 작업 중 남은 타임스탬프 백업(`pre-muse-chat-removal`/`pre-cleanup-old-providers`)에서 Python으로 실키 재조합해 복구 |
 | P30 | `/res|chat|mes/v1/models`가 프로토콜 무관 동일 무료 목록 반환(이름 패턴만으론 qwen/gemini 오분류) | zen 공식 문서(`zen.mdx` "Endpoints" 표, GitHub `anomalyco/opencode`)를 fetch해서 모델→포맷 맵 동적 생성, 문서에 없는 모델만 이름 패턴 폴백 — zen 서버 소스(`packages/console/.../zen/util/handler.ts`)에서 `formatFilter` 불일치 시 하드 거부(`ModelError`)함을 교차 확인 |
+| P31 | `[400] JSON schema exceeds the maximum nesting depth of 10 levels` | MCP 도구 다수 클라이언트의 깊게 중첩된 tool `parameters`/`input_schema`를 무검증 forward → `capSchemaDepth`/`capToolsDepth`로 9레벨 초과 분기를 leaf로 degrade, tools를 다루는 전 경로(`/v1/messages`·`/v1/chat/completions`·`/v1/responses`·muse·native passthrough)에 적용 |
 
 **교훈 총정리(반복해서 나온 것들)**:
 1. 헬스 프로브 성공 ≠ 실제 요청 경로 정상. 회귀 검증은 항상 클라이언트가 실제로 때리는 엔드포인트로.

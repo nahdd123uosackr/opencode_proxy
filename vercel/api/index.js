@@ -612,6 +612,77 @@ function anthropicToolChoiceToOpenAI(tc) {
   return tc;
 }
 
+// P31 fix (2026-09-15): Anthropic Messages API rejects tool JSON Schemas whose
+// nesting depth exceeds 10 with `[400] Error from provider (Console): Upstream
+// request failed: [invalid_request_error] JSON schema exceeds the maximum
+// nesting depth of 10 levels` -- MCP-heavy clients (many tools, each with
+// deeply nested object/array parameter schemas) routinely exceed this. None of
+// the tools-forwarding paths (/v1/messages, /v1/chat/completions, /v1/responses,
+// the res|chat|mes native passthrough routes, kilo/uncloseai/dahl) validated or
+// capped schema depth -- the client's schema was forwarded to Claude/muse
+// verbatim. Rather than reject the request, truncate any branch past maxDepth
+// down to a permissive leaf ({type, description, enum} only, dropping further
+// properties/items/anyOf) -- same "degrade an optional/unsupported shape
+// instead of failing outright" philosophy as the image_generation tool strip
+// (P24) and the compat-retry field stripper.
+function schemaChildNodes(node) {
+  const out = [];
+  if (node.properties && typeof node.properties === 'object') out.push(...Object.values(node.properties));
+  if (node.items) out.push(...(Array.isArray(node.items) ? node.items : [node.items]));
+  if (node.additionalProperties && typeof node.additionalProperties === 'object') out.push(node.additionalProperties);
+  if (node.patternProperties && typeof node.patternProperties === 'object') out.push(...Object.values(node.patternProperties));
+  for (const key of ['anyOf', 'oneOf', 'allOf']) if (Array.isArray(node[key])) out.push(...node[key]);
+  return out;
+}
+function capSchemaDepth(node, maxDepth, depth) {
+  depth = depth || 1;
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+  if (depth >= maxDepth) {
+    const leaf = {};
+    if (node.type) leaf.type = node.type;
+    if (node.description) leaf.description = node.description;
+    if (node.enum) leaf.enum = node.enum;
+    return leaf;
+  }
+  const out = { ...node };
+  if (node.properties && typeof node.properties === 'object') {
+    out.properties = {};
+    for (const [k, v] of Object.entries(node.properties)) out.properties[k] = capSchemaDepth(v, maxDepth, depth + 1);
+  }
+  if (node.items) {
+    out.items = Array.isArray(node.items)
+      ? node.items.map(it => capSchemaDepth(it, maxDepth, depth + 1))
+      : capSchemaDepth(node.items, maxDepth, depth + 1);
+  }
+  if (node.additionalProperties && typeof node.additionalProperties === 'object') {
+    out.additionalProperties = capSchemaDepth(node.additionalProperties, maxDepth, depth + 1);
+  }
+  if (node.patternProperties && typeof node.patternProperties === 'object') {
+    out.patternProperties = {};
+    for (const [k, v] of Object.entries(node.patternProperties)) out.patternProperties[k] = capSchemaDepth(v, maxDepth, depth + 1);
+  }
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(node[key])) out[key] = node[key].map(s => capSchemaDepth(s, maxDepth, depth + 1));
+  }
+  return out;
+}
+const MAX_TOOL_SCHEMA_DEPTH = parseInt(process.env.MAX_TOOL_SCHEMA_DEPTH || '9', 10);
+function capToolSchemaDepth(tool) {
+  if (!tool || typeof tool !== 'object') return tool;
+  const t = { ...tool };
+  if (t.function && typeof t.function === 'object') {
+    t.function = { ...t.function };
+    if (t.function.parameters) t.function.parameters = capSchemaDepth(t.function.parameters, MAX_TOOL_SCHEMA_DEPTH);
+  }
+  if (t.parameters) t.parameters = capSchemaDepth(t.parameters, MAX_TOOL_SCHEMA_DEPTH);
+  if (t.input_schema) t.input_schema = capSchemaDepth(t.input_schema, MAX_TOOL_SCHEMA_DEPTH);
+  return t;
+}
+function capToolsDepth(tools) {
+  if (!Array.isArray(tools)) return tools;
+  return tools.map(capToolSchemaDepth);
+}
+
 function responsesToChatJson(r, model) {
   let content = '';
   const toolCalls = [];
@@ -844,7 +915,7 @@ async function museViaResponses(upstreamModel, bodyObj, variant, isStream, zenAp
   const rbody = {
     model: upstreamModel,
     input: museToInput(bodyObj.messages),
-    tools: (bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean),
+    tools: capToolsDepth((bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean)),
     tool_choice: bodyObj.tool_choice,
     max_output_tokens: Math.max(131072, reqMax || 0),
     store: false,
@@ -1224,6 +1295,7 @@ const handle = async (req, res) => {
     // 대형 프롬프트 빈 choices 방지 — 700k 토큰 초과 시 오래된 히스토리 트렁케이트
     if (Array.isArray(body.messages)) body.messages = truncateMessagesIfNeeded(body.messages, body.instructions || body.system);
     if (Array.isArray(body.input)) body.input = truncateInputIfNeeded(body.input, body.instructions);
+    if (Array.isArray(body.tools)) body.tools = capToolsDepth(body.tools);
     let ub = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) ub.metadata = Object.assign({}, ub.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
     if (!/muse/i.test(upstreamModel)) ub = applyVariant(ub, effectiveVariant);
@@ -1310,7 +1382,7 @@ const handle = async (req, res) => {
     let anthMessages = anthropicMessagesToOpenAI(body);
     // 대형 프롬프트 빈 choices 방지
     anthMessages = truncateMessagesIfNeeded(anthMessages, body.system);
-    const anthTools = anthropicToolsToOpenAI(body.tools);
+    const anthTools = capToolsDepth(anthropicToolsToOpenAI(body.tools));
     const anthToolChoice = anthropicToolChoiceToOpenAI(body.tool_choice);
     let openReq = {
       model: upstreamModel,
@@ -1412,6 +1484,7 @@ const handle = async (req, res) => {
     const effectiveVariant = variant || (body.reasoning ? null : effortFromClientBody(body));
     // 대형 프롬프트 빈 choices 방지
     if (Array.isArray(body.input)) body.input = truncateInputIfNeeded(body.input, body.instructions);
+    if (Array.isArray(body.tools)) body.tools = capToolsDepth(body.tools);
     let upstreamBody = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
     if (/muse/i.test(upstreamModel)) {
       upstreamBody.metadata = Object.assign({}, upstreamBody.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
@@ -1539,11 +1612,21 @@ const handle = async (req, res) => {
     // 실패하는 두 가지 케이스만 최소 개입으로 방어한다(res/chat/mes 설계 원칙과 같은 성격의 예외, P24/P28):
     let outBody = rawBody;
     let patched = null;
+    // P31: JSON schema 10-depth 제한(Anthropic Messages API, muse 경유 시 동일 제약)은 라우트
+    // 셋(res/responses, chat/chat.completions, mes/messages) 전부에서 발생 가능하므로 공통 처리.
+    if (Array.isArray(body.tools)) {
+      const capped = capToolsDepth(body.tools);
+      if (JSON.stringify(capped) !== JSON.stringify(body.tools)) {
+        patched = patched || { ...body };
+        patched.tools = capped;
+        console.warn(`[compat] ${pathname}: capped tool schema nesting depth to ${MAX_TOOL_SCHEMA_DEPTH} before forwarding`);
+      }
+    }
     if (pathname === '/res/v1/responses') {
       // 1) zen은 tools[].type: "image_generation"을 아예 지원하지 않아 항상 400을 낸다. CLIProxyAPI의
       //    codex 실행기가 muse-spark 계열 /responses 호출에 이 tool을 기본으로 자동 주입해서 발생
       //    (클라이언트가 직접 보낸 tools엔 없음) — 이 tool 타입이 섞여 있을 때만 그것만 제거한다.
-      if (Array.isArray(body.tools) && body.tools.some(t => t && t.type === 'image_generation')) {
+      if (Array.isArray((patched || body).tools) && (patched || body).tools.some(t => t && t.type === 'image_generation')) {
         patched = patched || { ...body };
         const filtered = patched.tools.filter(t => !(t && t.type === 'image_generation'));
         patched.tools = filtered;

@@ -1612,6 +1612,97 @@ const handle = async (req, res) => {
     // 실패하는 두 가지 케이스만 최소 개입으로 방어한다(res/chat/mes 설계 원칙과 같은 성격의 예외, P24/P28):
     let outBody = rawBody;
     let patched = null;
+    // P32: 클라이언트(또는 클라이언트가 서버에 영구 저장한 대화 히스토리) 쪽에서 이미 같은
+    // call_id가 서로 다른 두 tool call에 중복 배정된 채로 들어오면, zen이 'Duplicate
+    // function_call_output' 400을 낸다 — 이 라우트군은 순수 passthrough라 pool이 다른 노드로
+    // 재시도해도 매번 동일한 바디를 다시 보내 똑같이 실패한다(요청 스코프 문제, failover로는
+    // 회복 불가). museToInput(P3)이 /v1/chat/completions 변환 경로에 이미 적용한 "먼저 나온
+    // 쌍만 유지" 방어를, 형태가 다른 이 세 라우트의 페이로드에도 동일 원칙으로 적용한다.
+    if (pathname === '/res/v1/responses' && Array.isArray((patched || body).input)) {
+      const src = (patched || body).input;
+      const seenCalls = new Set(), seenOutputs = new Set();
+      let removed = 0;
+      const filtered = src.filter(it => {
+        if (it && it.type === 'function_call') {
+          const id = it.call_id || '';
+          if (id && seenCalls.has(id)) { removed++; return false; }
+          if (id) seenCalls.add(id);
+        } else if (it && it.type === 'function_call_output') {
+          const id = it.call_id || '';
+          if (id && seenOutputs.has(id)) { removed++; return false; }
+          if (id) seenOutputs.add(id);
+        }
+        return true;
+      });
+      if (removed) {
+        patched = patched || { ...body };
+        patched.input = filtered;
+        console.warn(`[compat] /res/v1/responses: removed ${removed} duplicate function_call/function_call_output call_id entries before forwarding (P32)`);
+      }
+    } else if (pathname === '/chat/v1/chat/completions' && Array.isArray((patched || body).messages)) {
+      const src = (patched || body).messages;
+      const seenCalls = new Set(), seenOutputs = new Set();
+      let removed = 0;
+      const filtered = [];
+      for (const m of src) {
+        if (m && m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+          const kept = m.tool_calls.filter(tc => {
+            const id = (tc && tc.id) || '';
+            if (id && seenCalls.has(id)) { removed++; return false; }
+            if (id) seenCalls.add(id);
+            return true;
+          });
+          if (kept.length !== m.tool_calls.length) {
+            if (kept.length) filtered.push({ ...m, tool_calls: kept });
+            continue;
+          }
+          filtered.push(m);
+          continue;
+        }
+        if (m && m.role === 'tool') {
+          const id = m.tool_call_id || '';
+          if (id && seenOutputs.has(id)) { removed++; continue; }
+          if (id) seenOutputs.add(id);
+        }
+        filtered.push(m);
+      }
+      if (removed) {
+        patched = patched || { ...body };
+        patched.messages = filtered;
+        console.warn(`[compat] /chat/v1/chat/completions: removed ${removed} duplicate tool_calls/tool call_id entries before forwarding (P32)`);
+      }
+    } else if (pathname === '/mes/v1/messages' && Array.isArray((patched || body).messages)) {
+      const src = (patched || body).messages;
+      const seenCalls = new Set(), seenOutputs = new Set();
+      let removed = 0;
+      const filtered = [];
+      for (const m of src) {
+        if (m && Array.isArray(m.content)) {
+          const kept = m.content.filter(b => {
+            if (b && b.type === 'tool_use') {
+              const id = b.id || '';
+              if (id && seenCalls.has(id)) { removed++; return false; }
+              if (id) seenCalls.add(id);
+            } else if (b && b.type === 'tool_result') {
+              const id = b.tool_use_id || '';
+              if (id && seenOutputs.has(id)) { removed++; return false; }
+              if (id) seenOutputs.add(id);
+            }
+            return true;
+          });
+          if (kept.length !== m.content.length) {
+            if (kept.length) filtered.push({ ...m, content: kept });
+            continue;
+          }
+        }
+        filtered.push(m);
+      }
+      if (removed) {
+        patched = patched || { ...body };
+        patched.messages = filtered;
+        console.warn(`[compat] /mes/v1/messages: removed ${removed} duplicate tool_use/tool_result id entries before forwarding (P32)`);
+      }
+    }
     // P31: JSON schema 10-depth 제한(Anthropic Messages API, muse 경유 시 동일 제약)은 라우트
     // 셋(res/responses, chat/chat.completions, mes/messages) 전부에서 발생 가능하므로 공통 처리.
     if (Array.isArray(body.tools)) {

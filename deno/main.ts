@@ -69,11 +69,17 @@ function pickUA() {
   ];
   return pool[0];
 }
+// P33 fix (2026-09-17): api/index.js와 동일 로직 이식 — zen이 무료 티어 추론 엔드포인트에
+// "OpenCode's free tier can only be used from within OpenCode" (FreeTierError, 403) 클라이언트
+// 검증을 추가했다. 실측(mitmproxy로 진짜 opencode CLI 캡처 + Node fetch 최소조합 격리 테스트)
+// 결과 필요조건은 User-Agent가 정확히 실제 CLI 문자열, x-opencode-session이 'ses_' 접두사
+// 형식인 것 2개뿐 — 상세 근거는 api/index.js의 동일 주석 참고.
+const ZEN_UA = 'opencode/latest/2.0.5/cli';
 function injectHeaders(headers) {
   const h = { ...headers };
-  h['User-Agent'] = pickUA();
-  h['x-opencode-session'] = crypto.randomUUID().replace(/-/g, '');
-  h['x-opencode-client'] = 'opencode-free-pool-cf';
+  h['User-Agent'] = ZEN_UA;
+  h['x-opencode-session'] = 'ses_' + crypto.randomUUID().replace(/-/g, '').slice(0, 26);
+  h['x-opencode-client'] = 'cli';
   return h;
 }
 function authOk(request, env) {

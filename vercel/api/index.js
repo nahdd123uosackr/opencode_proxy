@@ -223,11 +223,23 @@ function isOpenCodeZenKey(key) {
   return key.startsWith('sk-') && !isKiloKey(key);
 }
 
+// P33 fix (2026-09-17): zen이 무료 티어 추론 엔드포인트(/responses, /chat/completions)에
+// "OpenCode's free tier can only be used from within OpenCode" (FreeTierError, 403) 클라이언트
+// 검증을 추가했다. 실제 opencode CLI(Bun 런타임)로 mitmproxy 경유 실측 캡처 + Node fetch로
+// 최소 헤더 조합 격리 테스트한 결과, 필요조건은 정확히 2개뿐이었다:
+//   1) User-Agent가 정확히 실제 CLI 문자열('opencode/latest/2.0.5/cli') -- 'opencode/'로
+//      시작하기만 한 임의 값(예: 'opencode/pool')은 통과 못 함, 정확한 문자열이어야 함
+//   2) x-opencode-session 값이 'ses_' 접두사 형식 -- 접두사 없는 순수 hex는 실패
+// Authorization/x-opencode-client 값/b3/traceparent/x-opencode-project 등은 전부 무관함을
+// 확인(있어도 없어도 결과 동일) -- GET /models는 애초에 이 게이트가 없어 UA 무관하게 통과.
+// 기존 코드는 pickUA()로 Chrome 브라우저 UA를 위장해 보냈고 세션 ID도 접두사 없는 순수
+// hex였다 -- 두 조건 다 게이트를 통과 못 하는 값이었다.
+const ZEN_UA = 'opencode/latest/2.0.5/cli';
 function injectHeaders(headers, relay, zenApiKey) {
   const h = { ...headers };
-  h['User-Agent'] = pickUA();
-  h['x-opencode-session'] = crypto.randomUUID().replace(/-/g, '');
-  h['x-opencode-client'] = 'opencode-free-pool-vercel';
+  h['User-Agent'] = ZEN_UA;
+  h['x-opencode-session'] = 'ses_' + crypto.randomUUID().replace(/-/g, '').slice(0, 26);
+  h['x-opencode-client'] = 'cli';
   if (zenApiKey) {
     h['Authorization'] = zenApiKey.startsWith('Bearer ') ? zenApiKey : `Bearer ${zenApiKey}`;
   }

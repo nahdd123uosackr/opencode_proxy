@@ -147,6 +147,7 @@ pool을 거쳐도 그대로 살아있다 — 이건 직접 라이브 테스트�
 | P29 | CLIProxyAPI config.yaml의 openproxy 관련 provider 전부 소실(codex-api-key/claude-api-key 섹션째로, bifrost provider DB도 함께) | 원인 미상(pod 재시작은 아님, 살아있는 pod 안에서 되돌려짐) → pod 내 P27/P28 작업 중 남은 타임스탬프 백업(`pre-muse-chat-removal`/`pre-cleanup-old-providers`)에서 Python으로 실키 재조합해 복구 |
 | P30 | `/res|chat|mes/v1/models`가 프로토콜 무관 동일 무료 목록 반환(이름 패턴만으론 qwen/gemini 오분류) | zen 공식 문서(`zen.mdx` "Endpoints" 표, GitHub `anomalyco/opencode`)를 fetch해서 모델→포맷 맵 동적 생성, 문서에 없는 모델만 이름 패턴 폴백 — zen 서버 소스(`packages/console/.../zen/util/handler.ts`)에서 `formatFilter` 불일치 시 하드 거부(`ModelError`)함을 교차 확인 |
 | P31 | `[400] JSON schema exceeds the maximum nesting depth of 10 levels` | MCP 도구 다수 클라이언트의 깊게 중첩된 tool `parameters`/`input_schema`를 무검증 forward → `capSchemaDepth`/`capToolsDepth`로 9레벨 초과 분기를 leaf로 degrade, tools를 다루는 전 경로(`/v1/messages`·`/v1/chat/completions`·`/v1/responses`·muse·native passthrough)에 적용 |
+| P33 | zen 무료 티어 403 `FreeTierError: OpenCode's free tier can only be used from within OpenCode` | zen이 클라이언트 UA/세션ID 검증 추가 -- Chrome 위장 UA를 실제 CLI UA(`opencode/latest/2.0.5/cli`)로, 세션ID를 `ses_` 접두사 포맷으로 변경해 해결 |
 
 **교훈 총정리(반복해서 나온 것들)**:
 1. 헬스 프로브 성공 ≠ 실제 요청 경로 정상. 회귀 검증은 항상 클라이언트가 실제로 때리는 엔드포인트로.

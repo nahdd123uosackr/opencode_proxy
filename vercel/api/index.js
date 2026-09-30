@@ -234,16 +234,100 @@ function isOpenCodeZenKey(key) {
 // 확인(있어도 없어도 결과 동일) -- GET /models는 애초에 이 게이트가 없어 UA 무관하게 통과.
 // 기존 코드는 pickUA()로 Chrome 브라우저 UA를 위장해 보냈고 세션 ID도 접두사 없는 순수
 // hex였다 -- 두 조건 다 게이트를 통과 못 하는 값이었다.
-const ZEN_UA = 'opencode/latest/2.0.5/cli';
+// P33 (2026-09-30): 2026-09-29 게이트 강화 이후 위 ZEN_UA/세션 형식이 더 이상 안 먹힌다.
+// OmniRoute(우리가 쓰는 게이트웨이 소프트웨어)의 v3.8.51에서 병합된 PR #14013("OpenCode
+// free tier request contract")의 실제 헤더/세션 ID 생성 규칙을 빌드 산출물(청크
+// 20420.js 등)에서 역공학해 그대로 이식했다. 오라클2에서 opencode.ai/zen/v1에 순수
+// Node fetch로 직접 검증(2026-09-30): space-bunny-free/big-pickle/mimo-v2.6-flash-free
+// 는 /chat/completions에서, muse-spark-1.2/1.3는 /responses에서(둘 다 tools에 실제
+// opencode CLI 도구 이름 여러 개를 넣어야 함 — _noop 하나만으로는 403 유지) 200 확인.
+//
+// 세션/메시지 ID 형식: `<prefix>` + sha256(또는 random 32B)의 앞 6바이트를 hex로,
+// 이어지는 14바이트를 base62로 인코딩한 문자열. 정규식: /^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+const ZEN_B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+function synthesizeOpencodeId(prefix) {
+  const digest = crypto.randomBytes(32);
+  const hexPart = digest.subarray(0, 6).toString('hex');
+  let b62Part = '';
+  for (const byte of digest.subarray(6, 20)) b62Part += ZEN_B62[byte % 62];
+  return prefix + hexPart + b62Part;
+}
+// 실측 정규식(청크 20420.js): /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/i — major>1 이거나
+// (major===1 && minor>=17)이어야 통과. 예전 'opencode/latest/2.0.5/cli'는 'latest'가
+// 숫자가 아니라서 이 매칭 자체가 실패해 게이트를 통과 못 했었다(P33 재발 원인).
+const ZEN_UA = 'opencode/1.18.31';
 function injectHeaders(headers, relay, zenApiKey) {
   const h = { ...headers };
   h['User-Agent'] = ZEN_UA;
-  h['x-opencode-session'] = 'ses_' + crypto.randomUUID().replace(/-/g, '').slice(0, 26);
-  h['x-opencode-client'] = 'cli';
+  h['x-opencode-session'] = synthesizeOpencodeId('ses_');
+  h['x-opencode-request'] = synthesizeOpencodeId('msg_');
+  h['x-opencode-client'] = 'desktop';
+  h['x-opencode-project'] = 'global';
   if (zenApiKey) {
     h['Authorization'] = zenApiKey.startsWith('Bearer ') ? zenApiKey : `Bearer ${zenApiKey}`;
   }
   return h;
+}
+
+// P33: zen free tier 게이트는 (a) 위 세션/UA 헤더 계약과 별개로 (b) body에 stream:true +
+// 비어있지 않은 tools 배열을 요구한다(모델별로 정확히 어떤 tool 이름이 통과하는지는
+// 예측 불가 — 실측: _noop 하나만으론 muse-spark/big-pickle 등 다수 모델에서 403
+// FreeTierError 유지, 실제 opencode CLI 도구 이름(bash/read/write/edit/glob/grep/
+// webfetch/websearch/task/todowrite) 여러 개를 한꺼번에 넣으면 통과). OmniRoute
+// PR #14013의 "observation-reuse"(성공한 이름을 캐시해 재사용) 전략을 간소화해서,
+// 매번 이 고정된 실측 검증 도구 이름 세트를 채워 넣는 것으로 대체한다 — 동적 관찰
+// 캐시까지는 필요 없고, 이 세트 자체가 이미 muse-spark 포함 여러 모델에서 통과 확인됨.
+const ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES = ['bash', 'read', 'write', 'edit', 'glob', 'grep', 'webfetch', 'websearch', 'task', 'todowrite'];
+function zenPlaceholderToolsFor(requestFormat) {
+  if (requestFormat === 'responses') {
+    return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => ({
+      type: 'function', name, description: 'Do not call this tool. It exists only to satisfy a client contract requirement.', parameters: { type: 'object', properties: {} },
+    }));
+  }
+  return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => ({
+    type: 'function',
+    function: { name, description: 'Do not call this tool. It exists only to satisfy a client contract requirement.', parameters: { type: 'object', properties: {} } },
+  }));
+}
+// muse-spark는 /chat/completions에서 tools 계약을 갖춰도 500 Internal server error로
+// 실패한다(실측 확인, 계약과 무관한 그 엔드포인트 자체의 결함) — /responses에서는
+// 동일 계약으로 200 확인됨. 그래서 free tier 모델 판별과 별개로, 어느 엔드포인트로
+// 보낼지는 기존 museViaResponses 라우팅(모델명 정규식)을 그대로 따른다.
+const ZEN_FREE_MODEL_SUFFIX_RE = /-free$/i;
+// OmniRoute PR #14013의 OPENCODE_FREE_MODELS 목록 — 이름이 '-free'로 안 끝나지만
+// 무료로 취급되는 모델(예: big-pickle). 실측: big-pickle도 tools 계약을 갖추면
+// /chat/completions에서 200 확인됨.
+const ZEN_KNOWN_FREE_MODELS = new Set(['big-pickle', 'deepseek-v4-flash-free', 'mimo-v2.5-free', 'hy3-free', 'nemotron-3-ultra-free', 'north-mini-code-free']);
+// P34: 동적 목록(zen.mdx "The free models:")과 하드코딩 폴백 목록의 합집합으로 판별.
+// 이름이 '-free'로 끝나는 건 그 자체로 이미 무료 신호이므로 문서 fetch 없이 즉시 처리하고,
+// 그렇지 않은 경우(big-pickle처럼)만 동적 목록을 조회한다 — 매 요청마다 불필요한 await을
+// 피하기 위한 최적화. 문서 fetch/파싱이 실패하면 getZenFreeModelSet()이 null을 반환하고,
+// 그 경우 하드코딩 Set만으로 판별(기존 동작과 동일하게 안전한 폴백).
+async function isZenFreeTierModel(modelId) {
+  const id = String(modelId || '');
+  if (ZEN_FREE_MODEL_SUFFIX_RE.test(id) || ZEN_KNOWN_FREE_MODELS.has(id)) return true;
+  const dynamicSet = await getZenFreeModelSet();
+  return !!(dynamicSet && dynamicSet.has(id));
+}
+// body가 plain object일 때만 stream:true 강제 + tools 보강(clientToolNames가 이미
+// 있으면 건드리지 않음 — 실제 클라이언트가 tools를 쓰는 요청은 그 값을 존중).
+// 실측(2026-09-30): tools 1개(_noop 또는 클라이언트의 단일 함수)만으로는 다수 모델에서
+// 여전히 403 — 실제 opencode CLI 도구 이름 여러 개(6개+)를 섞어야 통과했다. 그래서
+// 클라이언트가 tools를 보냈어도 개수가 적으면(< ZEN_MIN_TOOLS) 플레이스홀더로 보강해
+// 채워 넣는다. 클라이언트 이름과 겹치는 플레이스홀더는 추가하지 않는다.
+const ZEN_MIN_TOOLS = 6;
+function applyZenFreeTierContract(body, requestFormat) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const next = { ...body, stream: true };
+  const existing = Array.isArray(next.tools) ? next.tools : [];
+  if (existing.length >= ZEN_MIN_TOOLS) return next;
+  const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean));
+  const placeholders = zenPlaceholderToolsFor(requestFormat).filter((t) => {
+    const name = (t.function && t.function.name) || t.name;
+    return !existingNames.has(name);
+  });
+  next.tools = [...existing, ...placeholders];
+  return next;
 }
 
 function authOk(req) {
@@ -695,6 +779,55 @@ function capToolsDepth(tools) {
   return tools.map(capToolSchemaDepth);
 }
 
+// P33: free tier 계약이 stream:true를 강제하므로, 클라이언트가 stream:false를
+// 원했던 요청은 SSE로 받은 뒤 여기서 표준 chat.completion JSON으로 재조립한다
+// (OmniRoute PR #14013의 "forced-stream-then-rebuild" 전략과 동일 원칙).
+function rebuildChatJsonFromForcedStream(sseText, model) {
+  let content = '';
+  let role = 'assistant';
+  let finishReason = 'stop';
+  let usage = null;
+  let id = `chatcmpl-${crypto.randomUUID().slice(0, 8)}`;
+  for (const line of sseText.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const payload = t.slice(5).trim();
+    if (payload === '[DONE]' || !payload) continue;
+    let evt;
+    try { evt = JSON.parse(payload); } catch { continue; }
+    if (evt.id) id = evt.id;
+    const choice = evt.choices && evt.choices[0];
+    if (!choice) { if (evt.usage) usage = evt.usage; continue; }
+    const delta = choice.delta || {};
+    if (delta.role) role = delta.role;
+    if (typeof delta.content === 'string') content += delta.content;
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+    if (evt.usage) usage = evt.usage;
+  }
+  return {
+    id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, message: { role, content }, finish_reason: finishReason }],
+    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
+
+// P33: museViaResponses가 free tier 계약 때문에 body.stream을 강제로 true로 보내면
+// (클라이언트가 stream:false를 원했어도) upstream이 Responses API SSE로 답한다 —
+// 여기서 완성된 response 객체를 조립해 기존 responsesToChatJson()에 그대로 넘긴다.
+function collectResponsesObjectFromSSE(sseText) {
+  let finalResponse = null;
+  for (const line of sseText.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let evt;
+    try { evt = JSON.parse(payload); } catch { continue; }
+    if (evt.type === 'response.completed' && evt.response) finalResponse = evt.response;
+  }
+  return finalResponse;
+}
+
 function responsesToChatJson(r, model) {
   let content = '';
   const toolCalls = [];
@@ -880,6 +1013,31 @@ const ZEN_DOCS_URL = 'https://raw.githubusercontent.com/anomalyco/opencode/dev/p
 const ZEN_ENDPOINT_MAP_TTL = 6 * 60 * 60 * 1000; // 문서는 자주 안 바뀌므로 6시간
 let zenEndpointMapCache = null, zenEndpointMapCacheTime = 0;
 
+// zen.mdx의 Endpoints 표를 파싱하되, 이번엔 Model(표시명) 컬럼도 함께 뽑는다 —
+// "The free models:" 목록(아래 getZenFreeModelSet)이 표시명 기준이라, 표시명→ID로
+// 조인해야 실제 API에 쓰는 model id를 얻을 수 있다. 표시명과 ID 둘 다 캡처하도록
+// 확장한 것 외엔 기존 getZenEndpointMap(P29/P30)과 동일 파싱 로직.
+async function parseZenEndpointsTable(text) {
+  const m = text.match(/## Endpoints\n[\s\S]*?\n\| *Model[^\n]*\n\|[-\s|]+\n([\s\S]*?)\n\n/);
+  if (!m) throw new Error('endpoint table not found in zen.mdx (markup changed?)');
+  const map = {}; // id -> endpoint 'chat'|'responses'|'messages'|'gemini-native'
+  const displayNameToId = {}; // 'Muse Spark 1.3 Contributor Free' -> 'muse-spark-1.3-contributor-free'
+  for (const line of m[1].split('\n')) {
+    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+    if (cells.length < 3 || !cells[1]) continue;
+    const displayName = cells[0];
+    const id = cells[1];
+    const endpointUrl = cells[2].replace(/`/g, '');
+    if (endpointUrl.endsWith('/v1/responses')) map[id] = 'responses';
+    else if (endpointUrl.endsWith('/v1/chat/completions')) map[id] = 'chat';
+    else if (endpointUrl.endsWith('/v1/messages')) map[id] = 'messages';
+    else if (/\/v1\/models\//.test(endpointUrl)) map[id] = 'gemini-native';
+    if (displayName) displayNameToId[displayName] = id;
+  }
+  if (Object.keys(map).length < 10) throw new Error('parsed suspiciously few rows (' + Object.keys(map).length + ')');
+  return { map, displayNameToId };
+}
+
 async function getZenEndpointMap() {
   const now = Date.now();
   if (zenEndpointMapCache && (now - zenEndpointMapCacheTime) < ZEN_ENDPOINT_MAP_TTL) return zenEndpointMapCache;
@@ -887,25 +1045,59 @@ async function getZenEndpointMap() {
     const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
     const text = await r.text();
-    const m = text.match(/## Endpoints\n[\s\S]*?\n\| *Model[^\n]*\n\|[-\s|]+\n([\s\S]*?)\n\n/);
-    if (!m) throw new Error('endpoint table not found in zen.mdx (markup changed?)');
-    const map = {};
-    for (const line of m[1].split('\n')) {
-      const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
-      if (cells.length < 3 || !cells[1]) continue;
-      const id = cells[1];
-      const endpointUrl = cells[2].replace(/`/g, '');
-      if (endpointUrl.endsWith('/v1/responses')) map[id] = 'responses';
-      else if (endpointUrl.endsWith('/v1/chat/completions')) map[id] = 'chat';
-      else if (endpointUrl.endsWith('/v1/messages')) map[id] = 'messages';
-      else if (/\/v1\/models\//.test(endpointUrl)) map[id] = 'gemini-native';
-    }
-    if (Object.keys(map).length < 10) throw new Error('parsed suspiciously few rows (' + Object.keys(map).length + ')');
+    const { map } = await parseZenEndpointsTable(text);
     zenEndpointMapCache = map;
     zenEndpointMapCacheTime = now;
     return map;
   } catch (e) {
     console.warn('[zen-endpoint-map] fetch/parse failed, falling back to name-pattern heuristic for all models:', e.message);
+    return null;
+  }
+}
+
+// P34 (2026-09-30): zen.mdx의 "The free models:" 불릿 리스트(Pricing 섹션 하단)를
+// 파싱해서 실제 무료 model id 집합을 동적으로 가져온다. 지금까지는 ZEN_KNOWN_FREE_MODELS
+// 같은 하드코딩 Set으로 관리했는데, zen이 새 무료 모델을 추가/제거할 때마다 코드를
+// 수동으로 고쳐야 했다 — 실제로 muse-spark-1.2-contributor-free/deepseek-v4-flash-free가
+// Endpoints 표에서 누락돼 있던 사례(P29/P30 주석)처럼 문서 자체도 API보다 뒤처질 수
+// 있으므로, 이 동적 목록은 항상 하드코딩 폴백 Set과 합집합으로 쓴다(폴백을 대체하지 않음).
+//
+// 포맷(실측, 2026-09-30):
+//   The free models:
+//
+//   - MiMo-V2.6-Flash Free is available on OpenCode for a limited time. ...
+//   - Big Pickle is a stealth model that's free on OpenCode for a limited time.
+//   ...
+// 각 불릿의 맨 앞부분이 Endpoints 표의 Model(표시명) 컬럼과 정확히 일치하는 문자열이다
+// (실측 확인: "Muse Spark 1.3 Contributor Free"가 두 곳에서 토씨 하나 안 틀리고 동일).
+// 표시명을 통째로 알아내려면 문장 전체를 파싱해야 하므로, displayNameToId의 키들을
+// 각 불릿 라인이 "그 키로 시작하는지"로 매칭한다(가장 긴 키 우선 — 부분 문자열 오매칭 방지).
+const ZEN_FREE_MODEL_SET_TTL = 6 * 60 * 60 * 1000;
+let zenFreeModelSetCache = null, zenFreeModelSetCacheTime = 0;
+async function getZenFreeModelSet() {
+  const now = Date.now();
+  if (zenFreeModelSetCache && (now - zenFreeModelSetCacheTime) < ZEN_FREE_MODEL_SET_TTL) return zenFreeModelSetCache;
+  try {
+    const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
+    const text = await r.text();
+    const { displayNameToId } = await parseZenEndpointsTable(text);
+    const listMatch = text.match(/The free models:\n\n([\s\S]*?)\n\n/);
+    if (!listMatch) throw new Error('"The free models:" list not found in zen.mdx (markup changed?)');
+    const displayNamesByLengthDesc = Object.keys(displayNameToId).sort((a, b) => b.length - a.length);
+    const ids = new Set();
+    for (const line of listMatch[1].split('\n')) {
+      const bullet = line.trim().replace(/^-\s*/, '');
+      if (!bullet) continue;
+      const matchedName = displayNamesByLengthDesc.find((name) => bullet.startsWith(name));
+      if (matchedName) ids.add(displayNameToId[matchedName]);
+    }
+    if (ids.size < 5) throw new Error('parsed suspiciously few free models (' + ids.size + ')');
+    zenFreeModelSetCache = ids;
+    zenFreeModelSetCacheTime = now;
+    return ids;
+  } catch (e) {
+    console.warn('[zen-free-model-set] fetch/parse failed, falling back to hardcoded list only:', e.message);
     return null;
   }
 }
@@ -924,19 +1116,34 @@ const MODELS_TTL = 60 * 60 * 1000;
 
 async function museViaResponses(upstreamModel, bodyObj, variant, isStream, zenApiKey) {
   const reqMax = Math.max(bodyObj.max_tokens || 0, bodyObj.max_output_tokens || 0);
+  const convertedTools = capToolsDepth((bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean));
+  const isFreeTier = await isZenFreeTierModel(upstreamModel);
+  // P33: 클라이언트가 tools를 적게(또는 안) 보냈으면(가장 흔한 케이스 — muse-spark는
+  // free tier 게이트 대상이라 tools가 부족하면 403) 실측 검증된 플레이스홀더 도구로
+  // 채워 최소 개수(ZEN_MIN_TOOLS)를 맞춘다. 클라이언트가 보낸 이름과 겹치면 스킵.
+  let tools = convertedTools;
+  if (isFreeTier && convertedTools.length < ZEN_MIN_TOOLS) {
+    const existingNames = new Set(convertedTools.map((t) => t.name).filter(Boolean));
+    const placeholders = zenPlaceholderToolsFor('responses').filter((t) => !existingNames.has(t.name));
+    tools = [...convertedTools, ...placeholders];
+  }
   const rbody = {
     model: upstreamModel,
     input: museToInput(bodyObj.messages),
-    tools: capToolsDepth((bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean)),
+    tools,
     tool_choice: bodyObj.tool_choice,
     max_output_tokens: Math.max(131072, reqMax || 0),
     store: false,
     include: ['reasoning.encrypted_content'],
     reasoning: { effort: variant ? (MUSE_EFFORT[variant] || 'high') : 'low', summary: 'auto' },
-    stream: !!isStream,
+    // P33: free tier 게이트는 body.stream===true를 요구한다 — 클라이언트가 stream:false를
+    // 원했어도(isStream=false) upstream에는 강제로 true를 보내야 통과한다. 호출부가
+    // isStream 값을 보고 SSE를 그대로 흘릴지 JSON으로 재조립할지 이미 분기하므로
+    // 여기서 body.stream을 강제해도 클라이언트에게 가는 응답 형태는 안 바뀐다.
+    stream: isFreeTier ? true : !!isStream,
     metadata: { _nonce: crypto.randomUUID().slice(0, 12) },
   };
-  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
   return fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(rbody) });
 }
 
@@ -1312,10 +1519,16 @@ const handle = async (req, res) => {
     if (/muse/i.test(upstreamModel)) ub.metadata = Object.assign({}, ub.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
     if (!/muse/i.test(upstreamModel)) ub = applyVariant(ub, effectiveVariant);
 
-    const upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), effectiveVariant);
+let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), effectiveVariant);
     if (effectiveVariant && /muse/i.test(upstreamModel)) delete upstreamBody.reasoning_effort, upstreamBody.reasoning = { effort: MUSE_EFFORT[effectiveVariant] || 'high' };
+    // P33: muse 계열이 아닌 다른 '-free' 무료 모델(space-bunny-free/big-pickle/
+    // mimo-v2.6-flash-free 등)도 이 /chat/completions 경로에서 동일한 free tier
+    // 게이트를 탄다 — tools가 비어있으면 stream:true 강제 + 플레이스홀더 도구 주입.
+    if (!/muse/i.test(upstreamModel) && await isZenFreeTierModel(upstreamModel)) {
+      upstreamBody = applyZenFreeTierContract(upstreamBody, 'chat');
+    }
 
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
     headers['Cache-Control'] = 'no-store';
 
     try {
@@ -1330,7 +1543,20 @@ const handle = async (req, res) => {
           return res.end();
         }
         if (fetchRes.ok) {
-          const cj = responsesToChatJson(await fetchRes.json(), upstreamModel);
+          // P33: free tier 모델은 museViaResponses가 body.stream을 강제로 true로
+          // 보냈을 수 있다(클라이언트는 stream:false를 원했어도) — 그 경우 upstream이
+          // JSON이 아니라 Responses SSE로 응답하므로 .json()이 아니라 SSE 텍스트를
+          // 모아서 response.completed 이벤트에서 최종 객체를 추출해야 한다.
+          const ct = fetchRes.headers.get('content-type') || '';
+          let responseObj;
+          if (ct.includes('text/event-stream')) {
+            const sseText = await fetchRes.text();
+            responseObj = collectResponsesObjectFromSSE(sseText);
+            if (!responseObj) throw new Error('forced-stream response missing response.completed event');
+          } else {
+            responseObj = await fetchRes.json();
+          }
+          const cj = responsesToChatJson(responseObj, upstreamModel);
           if (zenApiKey) markKeySuccess(zenApiKey);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify(cj));
@@ -1361,10 +1587,23 @@ const handle = async (req, res) => {
         res.writeHead(mappedStatus, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         return res.end(bodyText);
       }
+      // P34 fix: isErrPayload인데 status가 200이 아닌 경우(예: 400 "Endpoint is
+      // unavailable")를 위 두 분기가 못 잡으면, 아래 stream:true 강제 재조립 로직이
+      // 에러 JSON을 SSE로 착각해 빈 content:""로 감춰버렸다(실측: ling-3.0-flash-fin-free
+      // 400을 200 빈 응답으로 둔갑시킴). 진짜 upstream 에러는 원본 status/body 그대로 전달.
+      if (isErrPayload) {
+        res.writeHead(fetchRes.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(bodyText);
+      }
 
       if (body.stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
         return res.end(bodyText);
+      } else if (upstreamBody.stream && !body.stream) {
+        // P33: 클라이언트는 stream:false를 원했지만 free tier 계약 때문에 upstream엔
+        // stream:true로 보냈다 — SSE로 온 응답을 표준 JSON으로 재조립해서 돌려준다.
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(rebuildChatJsonFromForcedStream(bodyText, upstreamModel)));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(bodyText);

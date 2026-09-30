@@ -322,8 +322,15 @@ const ZEN_MIN_TOOLS = 6;
 function applyZenFreeTierContract(body, requestFormat) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
   const next = { ...body, stream: true };
-  const existing = Array.isArray(next.tools) ? next.tools : [];
-  if (existing.length >= ZEN_MIN_TOOLS) return next;
+  let existing = Array.isArray(next.tools) ? next.tools : [];
+  // P36 fix: CLIProxyAPI의 codex 실행기 등이 자동 주입하는 type:"image_generation"
+  // 같은 비호환 도구는 zen이 타입 자체를 미지원해 403/400으로 거부한다(P24 교훈).
+  // 플레이스홀더를 채우기 전에 이런 비호환 도구를 먼저 걸러낸다.
+  existing = existing.filter((t) => t && t.type !== 'image_generation');
+  if (existing.length >= ZEN_MIN_TOOLS) {
+    next.tools = existing;
+    return next;
+  }
   const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean));
   const placeholders = zenPlaceholderToolsFor(requestFormat).filter((t) => {
     const name = (t.function && t.function.name) || t.name;
@@ -1119,7 +1126,8 @@ const MODELS_TTL = 60 * 60 * 1000;
 
 async function museViaResponses(upstreamModel, bodyObj, variant, isStream, zenApiKey) {
   const reqMax = Math.max(bodyObj.max_tokens || 0, bodyObj.max_output_tokens || 0);
-  const convertedTools = capToolsDepth((bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean));
+  const filteredTools = (bodyObj.tools || []).filter((t) => t && t.type !== 'image_generation');
+  const convertedTools = capToolsDepth(filteredTools.map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean));
   const isFreeTier = await isZenFreeTierModel(upstreamModel);
   // P33: 클라이언트가 tools를 적게(또는 안) 보냈으면(가장 흔한 케이스 — muse-spark는
   // free tier 게이트 대상이라 tools가 부족하면 403) 실측 검증된 플레이스홀더 도구로

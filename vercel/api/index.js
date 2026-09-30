@@ -1757,8 +1757,14 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     if (Array.isArray(upstreamBody.instructions) && typeof upstreamBody.instructions === 'string') {
       // instructions는 문자열 그대로 유지 — 배열이면 이미 input으로 처리됨
     }
+    // P36: /v1/responses 네이티브 호출 경로(opencode-free-res provider 등)도 free tier
+    // 모델이면 동일한 게이트(tools 배열 필수 + stream:true 강제)를 탄다 — 이 경로에서
+    // 누락되어 403 FreeTierError가 발생하던 사고를 해결.
+    if (await isZenFreeTierModel(upstreamModel)) {
+      upstreamBody = applyZenFreeTierContract(upstreamBody, 'responses');
+    }
 
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
     try {
       let fr = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       if (fr.status === 400) {
@@ -1992,7 +1998,24 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
         }
       }
     }
+    // P36: /res/v1/responses, /chat/v1/chat/completions 등 네이티브 passthrough
+    // 라우트도 free tier 모델이면 동일한 게이트(tools 배열 필수 + stream:true 강제)를
+    // 탄다 — opencode-free-res provider 등이 /res/v1/responses로 직접 호출할 때
+    // tools 누락으로 403 FreeTierError가 나던 사고를 방어.
+    const { upstreamModel: reqModel } = parseModel(body.model);
+    if (await isZenFreeTierModel(reqModel)) {
+      const format = pathname === '/res/v1/responses' ? 'responses' : 'chat';
+      const cur = patched || body;
+      const contractApplied = applyZenFreeTierContract(cur, format);
+      if (contractApplied !== cur) {
+        patched = contractApplied;
+      }
+    }
     if (patched) outBody = JSON.stringify(patched);
+    const finalStream = isStream || ((patched || body).stream === true);
+    if (finalStream && !headers['Accept']?.includes('text/event-stream')) {
+      headers['Accept'] = 'text/event-stream';
+    }
     try {
       const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: outBody, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       const ct = fr.headers.get('content-type') || 'application/json';

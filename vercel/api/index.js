@@ -119,7 +119,10 @@ async function getKiloFreeModels() {
 // === UncloseAI 프로바이더 (완전 무인증, OmniRoute registry authType:"optional"로 확인) ===
 // 클라이언트가 어떤 키를 보내든(zen/kilo/없음) 무관하게 항상 사용 가능 — 업스트림이 키 자체를
 // 요구하지 않는다(2026-09-12 실측: 키 없이 /v1/models·/v1/chat/completions 둘 다 200).
-const UNCLOSEAI_BASE = 'https://hermes.ai.unturf.com';
+// 2026-09-30: hermes.ai.unturf.com이 죽어서(502, 실측 확인 — pool 경유 /uncloseai/ 요청이
+// "all upstreams exhausted"로 45개 노드 전부 실패) qwen.ai.unturf.com으로 교체. 모델 목록
+// 재확인 결과 turboderp/Qwen3.8-27B-exl3 그대로 서빙 중이라 config.yaml 쪽 모델명은 안 바꿔도 됨.
+const UNCLOSEAI_BASE = 'https://qwen.ai.unturf.com';
 let uncloseaiModelsCache = null, uncloseaiModelsCacheTime = 0;
 
 async function getUncloseaiModels() {

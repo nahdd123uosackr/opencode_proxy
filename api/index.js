@@ -312,12 +312,11 @@ async function isZenFreeTierModel(modelId) {
   const dynamicSet = await getZenFreeModelSet();
   return !!(dynamicSet && dynamicSet.has(id));
 }
-// body가 plain object일 때만 stream:true 강제 + tools 보강(clientToolNames가 이미
-// 있으면 건드리지 않음 — 실제 클라이언트가 tools를 쓰는 요청은 그 값을 존중).
-// 실측(2026-09-30): tools 1개(_noop 또는 클라이언트의 단일 함수)만으로는 다수 모델에서
-// 여전히 403 — 실제 opencode CLI 도구 이름 여러 개(6개+)를 섞어야 통과했다. 그래서
-// 클라이언트가 tools를 보냈어도 개수가 적으면(< ZEN_MIN_TOOLS) 플레이스홀더로 보강해
-// 채워 넣는다. 클라이언트 이름과 겹치는 플레이스홀더는 추가하지 않는다.
+// body가 plain object일 때만 stream:true 강제 + tools 보강.
+// 실측(2026-09-30): zen free-tier 게이트는 tools 배열에 opencode CLI 고유 도구 이름
+// (bash/read/write/...)이 들어가는지로 판정한다(재현 실험: Claude Code 도구 10개나
+// mcp__* 10개는 403, CLI 이름 10개는 200 — 개수와 무관). 그래서 클라이언트가 보낸
+// tools를 종류와 무관하게 전부 보존한 채 CLI 플레이스홀더와 합집합을 항상 만든다.
 const ZEN_MIN_TOOLS = 6;
 function applyZenFreeTierContract(body, requestFormat) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
@@ -327,10 +326,11 @@ function applyZenFreeTierContract(body, requestFormat) {
   // 같은 비호환 도구는 zen이 타입 자체를 미지원해 403/400으로 거부한다(P24 교훈).
   // 플레이스홀더를 채우기 전에 이런 비호환 도구를 먼저 걸러낸다.
   existing = existing.filter((t) => t && t.type !== 'image_generation');
-  if (existing.length >= ZEN_MIN_TOOLS) {
-    next.tools = existing;
-    return next;
-  }
+  // P37 fix: zen의 free-tier 게이트는 tools에 opencode CLI 고유 도구 이름(bash/read/write/...)
+  // 이 들어와야만 통과한다(P37 재현 실험). 이전 P36 조건문은 "클라이언트가 보낸 tools가 6개 이상
+  // 이면 그대로 통과"라고 해 Claude Code의 Bash/Read/mcp__* 같은 CLI가 아닌 도구만으로
+  // 6개 채워져도 보강 없이 그대로 zen에 건네면서 403 FreeTierError가 났다.
+  // 클라이언트 도구는 모두 보존하면서 CLI 플레이스홀더와 합집합을 항상 만든다.
   const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean));
   const placeholders = zenPlaceholderToolsFor(requestFormat).filter((t) => {
     const name = (t.function && t.function.name) || t.name;
@@ -1129,11 +1129,12 @@ async function museViaResponses(upstreamModel, bodyObj, variant, isStream, zenAp
   const filteredTools = (bodyObj.tools || []).filter((t) => t && t.type !== 'image_generation');
   const convertedTools = capToolsDepth(filteredTools.map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean));
   const isFreeTier = await isZenFreeTierModel(upstreamModel);
-  // P33: 클라이언트가 tools를 적게(또는 안) 보냈으면(가장 흔한 케이스 — muse-spark는
-  // free tier 게이트 대상이라 tools가 부족하면 403) 실측 검증된 플레이스홀더 도구로
-  // 채워 최소 개수(ZEN_MIN_TOOLS)를 맞춘다. 클라이언트가 보낸 이름과 겹치면 스킵.
+  // P37: zen의 free-tier 게이트는 tools에 opencode CLI 고유 도구 이름(bash/read/write/...)
+  // 이 들어와야만 통과한다(P37 재현 실험) — 개수 조건이 아니라 이름 조건이다. 그래서
+  // 클라이언트가 보낸 tools를 종류/개수와 무관하게 전부 보존한 채 CLI 플레이스홀더와
+  // 합집합을 항상 만든다.
   let tools = convertedTools;
-  if (isFreeTier && convertedTools.length < ZEN_MIN_TOOLS) {
+  if (isFreeTier) {
     const existingNames = new Set(convertedTools.map((t) => t.name).filter(Boolean));
     const placeholders = zenPlaceholderToolsFor('responses').filter((t) => !existingNames.has(t.name));
     tools = [...convertedTools, ...placeholders];
@@ -1672,7 +1673,16 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
           await pumpResponsesSSEToAnthropic(mfr.body, aw);
           return res.end();
         }
-        const cj = responsesToChatJson(await mfr.json(), upstreamModel);
+        const ct = mfr.headers.get('content-type') || '';
+        let responseObj;
+        if (ct.includes('text/event-stream')) {
+          const sseText = await mfr.text();
+          responseObj = collectResponsesObjectFromSSE(sseText);
+          if (!responseObj) throw new Error('forced-stream response missing response.completed event');
+        } else {
+          responseObj = await mfr.json();
+        }
+        const cj = responsesToChatJson(responseObj, upstreamModel);
         const choice = (cj.choices && cj.choices[0]) || {};
         const msg = choice.message || {};
         const contentBlocks = [];

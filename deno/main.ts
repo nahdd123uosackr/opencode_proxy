@@ -18,6 +18,60 @@ const ZEN_ENDPOINT_MAP_TTL = 6 * 60 * 60 * 1000; // 문서는 자주 안 바뀌�
 let zenEndpointMapCache: Record<string, string> | null = null;
 let zenEndpointMapCacheTime = 0;
 
+function parseZenEndpointsTable(text: string) {
+  const m = text.match(/## Endpoints\n[\s\S]*?\n\| *Model[^\n]*\n\|[-\s|]+\n([\s\S]*?)\n\n/);
+  if (!m) throw new Error('endpoint table not found in zen.mdx (markup changed?)');
+  const map: Record<string, string> = {};
+  const displayNameToId: Record<string, string> = {};
+  for (const line of m[1].split('\n')) {
+    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+    if (cells.length < 3 || !cells[1]) continue;
+    const displayName = cells[0];
+    const id = cells[1];
+    const endpointUrl = cells[2].replace(/`/g, '');
+    if (endpointUrl.endsWith('/v1/responses')) map[id] = 'responses';
+    else if (endpointUrl.endsWith('/v1/chat/completions')) map[id] = 'chat';
+    else if (endpointUrl.endsWith('/v1/messages')) map[id] = 'messages';
+    else if (/\/v1\/models\//.test(endpointUrl)) map[id] = 'gemini-native';
+    if (displayName) displayNameToId[displayName] = id;
+  }
+  if (Object.keys(map).length < 10) throw new Error('parsed suspiciously few rows (' + Object.keys(map).length + ')');
+  return { map, displayNameToId };
+}
+
+// P34: zen.mdx "The free models:" 불릿 목록을 동적으로 파싱해 무료 model id 집합을 얻는다.
+// 하드코딩 ZEN_KNOWN_FREE_MODELS와의 합집합으로 쓰며, 실패하면 null(하드코딩만 사용).
+const ZEN_FREE_MODEL_SET_TTL = 6 * 60 * 60 * 1000;
+let zenFreeModelSetCache: Set<string> | null = null;
+let zenFreeModelSetCacheTime = 0;
+async function getZenFreeModelSet(): Promise<Set<string> | null> {
+  const now = Date.now();
+  if (zenFreeModelSetCache && (now - zenFreeModelSetCacheTime) < ZEN_FREE_MODEL_SET_TTL) return zenFreeModelSetCache;
+  try {
+    const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
+    const text = await r.text();
+    const { displayNameToId } = parseZenEndpointsTable(text);
+    const listMatch = text.match(/The free models:\n\n([\s\S]*?)\n\n/);
+    if (!listMatch) throw new Error('"The free models:" list not found in zen.mdx (markup changed?)');
+    const namesByLengthDesc = Object.keys(displayNameToId).sort((a, b) => b.length - a.length);
+    const ids = new Set<string>();
+    for (const line of listMatch[1].split('\n')) {
+      const bullet = line.trim().replace(/^-\s*/, '');
+      if (!bullet) continue;
+      const matchedName = namesByLengthDesc.find((name) => bullet.startsWith(name));
+      if (matchedName) ids.add(displayNameToId[matchedName]);
+    }
+    if (ids.size < 5) throw new Error('parsed suspiciously few free models (' + ids.size + ')');
+    zenFreeModelSetCache = ids;
+    zenFreeModelSetCacheTime = now;
+    return ids;
+  } catch (e) {
+    console.warn('[zen-free-model-set] fetch/parse failed, falling back to hardcoded list only:', (e as Error).message);
+    return null;
+  }
+}
+
 async function getZenEndpointMap(): Promise<Record<string, string> | null> {
   const now = Date.now();
   if (zenEndpointMapCache && (now - zenEndpointMapCacheTime) < ZEN_ENDPOINT_MAP_TTL) return zenEndpointMapCache;
@@ -25,20 +79,7 @@ async function getZenEndpointMap(): Promise<Record<string, string> | null> {
     const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
     const text = await r.text();
-    const m = text.match(/## Endpoints\n[\s\S]*?\n\| *Model[^\n]*\n\|[-\s|]+\n([\s\S]*?)\n\n/);
-    if (!m) throw new Error('endpoint table not found in zen.mdx (markup changed?)');
-    const map: Record<string, string> = {};
-    for (const line of m[1].split('\n')) {
-      const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
-      if (cells.length < 3 || !cells[1]) continue;
-      const id = cells[1];
-      const endpointUrl = cells[2].replace(/`/g, '');
-      if (endpointUrl.endsWith('/v1/responses')) map[id] = 'responses';
-      else if (endpointUrl.endsWith('/v1/chat/completions')) map[id] = 'chat';
-      else if (endpointUrl.endsWith('/v1/messages')) map[id] = 'messages';
-      else if (/\/v1\/models\//.test(endpointUrl)) map[id] = 'gemini-native';
-    }
-    if (Object.keys(map).length < 10) throw new Error('parsed suspiciously few rows (' + Object.keys(map).length + ')');
+    const { map } = parseZenEndpointsTable(text);
     zenEndpointMapCache = map;
     zenEndpointMapCacheTime = now;
     return map;
@@ -74,13 +115,96 @@ function pickUA() {
 // 검증을 추가했다. 실측(mitmproxy로 진짜 opencode CLI 캡처 + Node fetch 최소조합 격리 테스트)
 // 결과 필요조건은 User-Agent가 정확히 실제 CLI 문자열, x-opencode-session이 'ses_' 접두사
 // 형식인 것 2개뿐 — 상세 근거는 api/index.js의 동일 주석 참고.
-const ZEN_UA = 'opencode/latest/2.0.5/cli';
+// P33 (2026-09-30): api/index.js와 동일 — UA는 /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/ 를 통과해야
+// 하고(major>1 또는 1.17+), 세션/메시지 ID는 prefix + hex 12자 + base62 14자 형식이어야 한다.
+const ZEN_B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+function synthesizeOpencodeId(prefix: string): string {
+  const digest = crypto.getRandomValues(new Uint8Array(32));
+  let hexPart = '';
+  for (const byte of digest.subarray(0, 6)) hexPart += byte.toString(16).padStart(2, '0');
+  let b62Part = '';
+  for (const byte of digest.subarray(6, 20)) b62Part += ZEN_B62[byte % 62];
+  return prefix + hexPart + b62Part;
+}
+const ZEN_UA = 'opencode/1.18.31';
 function injectHeaders(headers) {
   const h = { ...headers };
   h['User-Agent'] = ZEN_UA;
-  h['x-opencode-session'] = 'ses_' + crypto.randomUUID().replace(/-/g, '').slice(0, 26);
-  h['x-opencode-client'] = 'cli';
+  h['x-opencode-session'] = synthesizeOpencodeId('ses_');
+  h['x-opencode-request'] = synthesizeOpencodeId('msg_');
+  h['x-opencode-client'] = 'desktop';
+  h['x-opencode-project'] = 'global';
   return h;
+}
+
+// P33~P37: zen free tier 게이트는 body에 stream:true + opencode CLI 도구 이름(bash/read/...)을 요구한다.
+// 클라이언트 tools는 모두 보존하고 CLI 플레이스홀더와의 합집합을 항상 만든다(개수가 아니라 이름 기준).
+const ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES = ['bash', 'read', 'write', 'edit', 'glob', 'grep', 'webfetch', 'websearch', 'task', 'todowrite'];
+function zenPlaceholderToolsFor(requestFormat: string): any[] {
+  const description = 'Do not call this tool. It exists only to satisfy a client contract requirement.';
+  if (requestFormat === 'responses') {
+    return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => ({ type: 'function', name, description, parameters: { type: 'object', properties: {} } }));
+  }
+  return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => ({ type: 'function', function: { name, description, parameters: { type: 'object', properties: {} } } }));
+}
+const ZEN_FREE_MODEL_SUFFIX_RE = /-free$/i;
+const ZEN_KNOWN_FREE_MODELS = new Set(['big-pickle', 'deepseek-v4-flash-free', 'mimo-v2.5-free', 'hy3-free', 'nemotron-3-ultra-free', 'north-mini-code-free']);
+async function isZenFreeTierModel(modelId: string): Promise<boolean> {
+  const id = String(modelId || '');
+  if (ZEN_FREE_MODEL_SUFFIX_RE.test(id) || ZEN_KNOWN_FREE_MODELS.has(id)) return true;
+  const dynamicSet = await getZenFreeModelSet();
+  return !!(dynamicSet && dynamicSet.has(id));
+}
+function applyZenFreeTierContract(body, requestFormat: string) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const next = { ...body, stream: true };
+  const existing = (Array.isArray(next.tools) ? next.tools : []).filter((t) => t && t.type !== 'image_generation');
+  const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean));
+  const placeholders = zenPlaceholderToolsFor(requestFormat).filter((t) => !existingNames.has((t.function && t.function.name) || t.name));
+  next.tools = [...existing, ...placeholders];
+  return next;
+}
+// free tier 계약이 stream:true를 강제하므로, stream:false를 원한 클라이언트에겐 SSE를 JSON으로 재조립해 돌려준다.
+function rebuildChatJsonFromForcedStream(sseText: string, model: string) {
+  let content = '';
+  let role = 'assistant';
+  let finishReason = 'stop';
+  let usage = null;
+  let id = `chatcmpl-${crypto.randomUUID().slice(0, 8)}`;
+  for (const line of sseText.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const payload = t.slice(5).trim();
+    if (payload === '[DONE]' || !payload) continue;
+    let evt;
+    try { evt = JSON.parse(payload); } catch { continue; }
+    if (evt.id) id = evt.id;
+    const choice = evt.choices && evt.choices[0];
+    if (!choice) { if (evt.usage) usage = evt.usage; continue; }
+    const delta = choice.delta || {};
+    if (delta.role) role = delta.role;
+    if (typeof delta.content === 'string') content += delta.content;
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+    if (evt.usage) usage = evt.usage;
+  }
+  return {
+    id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, message: { role, content }, finish_reason: finishReason }],
+    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
+function collectResponsesObjectFromSSE(sseText: string) {
+  let finalResponse = null;
+  for (const line of sseText.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let evt;
+    try { evt = JSON.parse(payload); } catch { continue; }
+    if (evt.type === 'response.completed' && evt.response) finalResponse = evt.response;
+  }
+  return finalResponse;
 }
 function authOk(request, env) {
   const key = env.PROXY_API_KEY || PROXY_API_KEY;
@@ -141,7 +265,7 @@ async function getKiloFreeModels() {
 // === UncloseAI 프로바이더 (완전 무인증, OmniRoute registry authType:"optional"로 확인) ===
 // 클라이언트가 어떤 키를 보내든(zen/kilo/없음) 무관하게 항상 사용 가능 — 업스트림이 키 자체를
 // 요구하지 않는다(2026-09-12 실측: 키 없이 /v1/models·/v1/chat/completions 둘 다 200).
-const UNCLOSEAI_BASE = 'https://hermes.ai.unturf.com';
+const UNCLOSEAI_BASE = 'https://qwen.ai.unturf.com';
 let uncloseaiModelsCache = null;
 let uncloseaiModelsCacheTime = 0;
 async function getUncloseaiModels() {
@@ -646,22 +770,37 @@ function responsesSSEToChatStream(body) {
 
 async function museChatResponse(upstreamModel, bodyObj, variant, isStream) {
   const reqMax = Math.max(bodyObj.max_tokens || 0, bodyObj.max_output_tokens || 0);
+  const convertedTools = capToolsDepth((bodyObj.tools || []).filter((t) => t && t.type !== 'image_generation').map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean));
+  const isFreeTier = await isZenFreeTierModel(upstreamModel);
+  let tools = convertedTools;
+  if (isFreeTier) {
+    const existingNames = new Set(convertedTools.map((t) => t.name).filter(Boolean));
+    tools = [...convertedTools, ...zenPlaceholderToolsFor('responses').filter((t) => !existingNames.has(t.name))];
+  }
   const rbody = {
     model: upstreamModel,
     input: museToInput(bodyObj.messages),
-    tools: capToolsDepth((bodyObj.tools || []).map(t => t && t.type === 'function' && t.function ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters } : t).filter(Boolean)),
+    tools,
     tool_choice: bodyObj.tool_choice,
     max_output_tokens: Math.max(131072, reqMax || 0),
     store: false,
     include: ['reasoning.encrypted_content'],
     reasoning: { effort: variant ? (MUSE_EFFORT[variant] || 'high') : 'low', summary: 'auto' },
-    stream: !!isStream,
+    // free tier 게이트가 stream:true를 요구한다. 클라이언트가 stream:false여도 upstream에는 true로 보내고
+    // 아래에서 SSE를 모아 JSON으로 재조립하므로 클라이언트가 받는 형태는 바뀌지 않는다.
+    stream: isFreeTier ? true : !!isStream,
     metadata: { _nonce: crypto.randomUUID().slice(0, 12) },
   };
-  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' });
   const r = await fetch(UPSTREAM + '/responses', { method: 'POST', headers, body: JSON.stringify(rbody) });
   if (!r.ok) return forwardStreamOrJson(r, false);
   if (isStream) return new Response(responsesSSEToChatStream(r.body), { status: 200, headers: { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });
+  const ct = r.headers.get('content-type') || '';
+  if (ct.includes('text/event-stream')) {
+    const responseObj = collectResponsesObjectFromSSE(await r.text());
+    if (!responseObj) return json({ error: { message: 'forced-stream response missing response.completed event' } }, 502);
+    return json(responsesToChatJson(responseObj, upstreamModel));
+  }
   return json(responsesToChatJson(await r.json(), upstreamModel));
 }
 
@@ -877,7 +1016,12 @@ export default {
           }
         }
       }
+      // P36: 네이티브 passthrough 라우트도 free tier 모델이면 동일한 게이트(stream:true + CLI 도구 이름)를 탄다.
+      if (await isZenFreeTierModel(parseModel(pbody.model).upstreamModel)) {
+        patched = applyZenFreeTierContract(patched || pbody, pathname === '/res/v1/responses' ? 'responses' : 'chat');
+      }
       if (patched) outText = JSON.stringify(patched);
+      if (isStream || (patched || pbody).stream === true) headers['Accept'] = 'text/event-stream';
       try {
         const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: outText });
         const ct = fr.headers.get('content-type') || 'application/json';
@@ -1085,8 +1229,11 @@ export default {
         }
         if (Array.isArray(body.tools)) body.tools = capToolsDepth(body.tools);
         if (isMuse) return await museChatResponse(upstreamModel, body, variant, isStream);
-        const upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), variant);
-        const r = await forward('/chat/completions', upstreamBody, isStream);
+        let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel }, 'chat'), variant);
+        if (await isZenFreeTierModel(upstreamModel)) upstreamBody = applyZenFreeTierContract(upstreamBody, 'chat');
+        const r = await forward('/chat/completions', upstreamBody, !!upstreamBody.stream);
+        if (!r.ok) return forwardStreamOrJson(r, false);
+        if (upstreamBody.stream && !isStream) return json(rebuildChatJsonFromForcedStream(await r.text(), upstreamModel));
         return forwardStreamOrJson(r, isStream);
       }
 
@@ -1109,7 +1256,14 @@ export default {
           upstreamBody = applyVariant(upstreamBody, effectiveVariant);
         }
         if (Array.isArray(upstreamBody.input)) upstreamBody.input = sanitizeResponsesInput(upstreamBody.input);
-        const r = await forward('/responses', upstreamBody, isStream);
+        if (await isZenFreeTierModel(upstreamModel)) upstreamBody = applyZenFreeTierContract(upstreamBody, 'responses');
+        const r = await forward('/responses', upstreamBody, !!upstreamBody.stream);
+        if (!r.ok) return forwardStreamOrJson(r, false);
+        if (upstreamBody.stream && !isStream) {
+          const responseObj = collectResponsesObjectFromSSE(await r.text());
+          if (!responseObj) return json({ error: { message: 'forced-stream response missing response.completed event' } }, 502);
+          return json(responseObj);
+        }
         return forwardStreamOrJson(r, isStream);
       }
 

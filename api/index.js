@@ -122,6 +122,29 @@ async function getKiloFreeModels() {
 // 2026-09-30: hermes.ai.unturf.com이 죽어서(502, 실측 확인 — pool 경유 /uncloseai/ 요청이
 // "all upstreams exhausted"로 45개 노드 전부 실패) qwen.ai.unturf.com으로 교체. 모델 목록
 // 재확인 결과 turboderp/Qwen3.8-27B-exl3 그대로 서빙 중이라 config.yaml 쪽 모델명은 안 바꿔도 됨.
+const BLOCKRUN_BASE = 'https://blockrun.ai/api/v1';
+let blockrunModelsCache = null, blockrunModelsCacheTime = 0;
+
+async function getBlockrunModels() {
+  const now = Date.now();
+  if (blockrunModelsCache && (now - blockrunModelsCacheTime) < 300000) return blockrunModelsCache;
+  try {
+    const r = await fetch(BLOCKRUN_BASE + '/models', { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const nowSec = Math.floor(now / 1000);
+    // filter only free models
+    const freeModels = (j.data || []).filter(m => m && m.id && (m.billing_mode === 'free' || (m.pricing && m.pricing.input === 0)));
+    const list = freeModels.map(m => ({ id: 'blockrun/' + m.id, object: 'model', created: nowSec, owned_by: 'blockrun' }));
+    blockrunModelsCache = list;
+    blockrunModelsCacheTime = now;
+    return list;
+  } catch (e) {
+    console.error('[blockrun models] fail', e.message);
+  }
+  return blockrunModelsCache || [];
+}
+
 const UNCLOSEAI_BASE = 'https://qwen.ai.unturf.com';
 let uncloseaiModelsCache = null, uncloseaiModelsCacheTime = 0;
 
@@ -1297,7 +1320,7 @@ const handle = async (req, res) => {
     }
   }
 
-  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/') || pathname.startsWith('/uncloseai/') || pathname.startsWith('/dahl/');
+  const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/') || pathname.startsWith('/uncloseai/') || pathname.startsWith('/dahl/') || pathname.startsWith('/blockrun/');
   if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(req)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid API key' } }));
@@ -1347,6 +1370,10 @@ const handle = async (req, res) => {
         data = data.concat(uncloseai);
       } catch {}
       try {
+        const blockrun = await getBlockrunModels();
+        data = data.concat(blockrun);
+      } catch {}
+      try {
         const dahl = await getDahlModels();
         data = data.concat(dahl);
       } catch {}
@@ -1372,13 +1399,15 @@ const handle = async (req, res) => {
     const hasZenPrefix = /^opencode\//i.test(modelStr);
     const hasUncloseaiPrefix = /^uncloseai\//i.test(modelStr);
     const hasDahlPrefix = /^dahl\//i.test(modelStr);
+    const hasBlockrunPrefix = /^blockrun\//i.test(modelStr);
 
-    // --- UncloseAI/Dahl 요청 처리 (kilo/zen 키 체계와 완전 무관 — 클라이언트가 보낸
+    // --- Blockrun/UncloseAI/Dahl 요청 처리 (kilo/zen 키 체계와 완전 무관 — 클라이언트가 보낸
     // Authorization은 무시하고 각 업스트림에 맞는 인증을 여기서 직접 구성한다) ---
-    if (hasUncloseaiPrefix || hasDahlPrefix) {
+    if (hasBlockrunPrefix || hasUncloseaiPrefix || hasDahlPrefix) {
       const isDahl = hasDahlPrefix;
-      const realModel = modelStr.replace(/^(uncloseai|dahl)\//i, '');
-      const upstreamBase = isDahl ? DAHL_BASE : UNCLOSEAI_BASE;
+      const isBlockrun = hasBlockrunPrefix;
+      const realModel = modelStr.replace(/^(blockrun|uncloseai|dahl)\//i, '');
+      const upstreamBase = isBlockrun ? BLOCKRUN_BASE : (isDahl ? DAHL_BASE : UNCLOSEAI_BASE);
       const uHeaders = { 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' };
       try {
         let fr;
@@ -2088,6 +2117,44 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
   // /kilo/v1과 같은 원칙(네이티브 엔드포인트, 접두사 없는 모델명)의 UncloseAI/Dahl 전용 라우트.
   // 레거시 /v1/models·/v1/chat/completions의 uncloseai/·dahl/ 접두사 라우팅과 별개로,
   // 클라이언트가 그 프로바이더만 쓰고 싶을 때 접두사 없이 바로 부를 수 있게 한다.
+  if (pathname === '/blockrun/v1/models') {
+    try {
+      const models = await getBlockrunModels();
+      const data = models.map(m => ({ ...m, id: m.id.replace(/^blockrun\//, '') }));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ object: 'list', data }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
+  if (req.method === 'POST' && pathname === '/blockrun/v1/chat/completions') {
+    const rawBody = Buffer.concat(chunks).toString('utf-8');
+    let body; try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'Invalid JSON' } })); }
+    if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
+    const realModel = String(body.model).replace(/^blockrun\//i, '');
+    const isStream = !!body.stream;
+    const uHeaders = { 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' };
+    try {
+      const ur = await fetch(BLOCKRUN_BASE + '/chat/completions', {
+        method: 'POST', headers: uHeaders, body: JSON.stringify({ ...body, model: realModel }),
+        signal: AbortSignal.timeout(parseInt(process.env.BLOCKRUN_TIMEOUT_MS || '120000', 10)),
+      });
+      const ct = ur.headers.get('content-type') || 'application/json';
+      res.writeHead(ur.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+      if (isStream && ur.body && ct.includes('text/event-stream')) {
+        const reader = ur.body.getReader(); const dec = new TextDecoder();
+        try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(dec.decode(value, { stream: true })); } } catch {}
+        return res.end();
+      }
+      return res.end(await ur.text());
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: e.message } }));
+    }
+  }
+
   if (pathname === '/uncloseai/v1/models') {
     try {
       const models = await getUncloseaiModels();

@@ -265,6 +265,23 @@ async function getKiloFreeModels() {
 // === UncloseAI 프로바이더 (완전 무인증, OmniRoute registry authType:"optional"로 확인) ===
 // 클라이언트가 어떤 키를 보내든(zen/kilo/없음) 무관하게 항상 사용 가능 — 업스트림이 키 자체를
 // 요구하지 않는다(2026-09-12 실측: 키 없이 /v1/models·/v1/chat/completions 둘 다 200).
+const BLOCKRUN_BASE = 'https://blockrun.ai/api/v1';
+let blockrunModelsCache = null;
+let blockrunModelsCacheTime = 0;
+async function getBlockrunModels() {
+  const now = Date.now();
+  if (blockrunModelsCache && (now - blockrunModelsCacheTime) < 300000) return blockrunModelsCache;
+  try {
+    const r = await fetch(BLOCKRUN_BASE + '/models', { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const nowSec = Math.floor(now / 1000);
+    const list = (j.data || []).filter((m: any) => m && m.id && (m.billing_mode === 'free' || (m.pricing && m.pricing.input === 0))).map((m: any) => ({ id: 'blockrun/' + m.id, object: 'model', created: nowSec, owned_by: 'blockrun' }));
+    blockrunModelsCache = list; blockrunModelsCacheTime = now;
+  } catch (e) { console.error('[blockrun models] fail', String(e).slice(0, 80)); }
+  return blockrunModelsCache || [];
+}
+
 const UNCLOSEAI_BASE = 'https://qwen.ai.unturf.com';
 let uncloseaiModelsCache = null;
 let uncloseaiModelsCacheTime = 0;
@@ -825,7 +842,7 @@ export default {
     if (pathname === '/health' || pathname === '/v1/health') {
       return json({ status: 'ok', upstream: UPSTREAM });
     }
-    const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/') || pathname.startsWith('/uncloseai/') || pathname.startsWith('/dahl/');
+    const isNativeProtocolPrefix = pathname.startsWith('/res/') || pathname.startsWith('/chat/') || pathname.startsWith('/mes/') || pathname.startsWith('/kilo/') || pathname.startsWith('/blockrun/') || pathname.startsWith('/uncloseai/') || pathname.startsWith('/dahl/');
     if ((pathname.startsWith('/v1/') || isNativeProtocolPrefix) && !authOk(request, env)) {
       return json({ error: { type: 'authentication_error', message: 'Invalid API key' } }, 401);
     }
@@ -1079,6 +1096,22 @@ export default {
       } catch (e) { return json({ error: { message: e.message } }, 502); }
     }
 
+    if (request.method === 'POST' && pathname === '/blockrun/v1/chat/completions') {
+      const rawText = await request.text();
+      let pbody; try { pbody = JSON.parse(rawText || '{}'); } catch { return json({ error: { message: 'Invalid JSON' } }, 400); }
+      if (!pbody.model) return json({ error: { message: 'model required' } }, 400);
+      const realModel = String(pbody.model).replace(/^blockrun\//i, '');
+      const isStream = !!pbody.stream;
+      const uHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
+      try {
+        const ur = await fetch(BLOCKRUN_BASE + '/chat/completions', { method: 'POST', headers: uHeaders, body: JSON.stringify({ ...pbody, model: realModel }) });
+        if (isStream && ur.ok) {
+          return new Response(ur.body, { status: 200, headers: { ...CORS, 'Content-Type': ur.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-store' } });
+        }
+        return new Response(await ur.text(), { status: ur.status, headers: { ...CORS, 'Content-Type': ur.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' } });
+      } catch (e) { return json({ error: { message: e.message } }, 502); }
+    }
+
     if (request.method === 'POST' && pathname === '/uncloseai/v1/chat/completions') {
       const rawText = await request.text();
       let pbody; try { pbody = JSON.parse(rawText || '{}'); } catch { return json({ error: { message: 'Invalid JSON' } }, 400); }
@@ -1181,10 +1214,11 @@ export default {
       // === UncloseAI/Dahl 모델 (uncloseai/, dahl/ 접두사) — kilo/zen 키 체계와 완전
       // 무관하게 직접 포워드. 클라이언트가 보낸 Authorization은 무시하고 각 업스트림에
       // 맞는 인증을 여기서 직접 구성한다(uncloseai는 무인증, dahl은 우리가 자체 발급한 토큰). ===
-      if (/^(uncloseai|dahl)\//i.test(String(body.model || ''))) {
+      if (/^(blockrun|uncloseai|dahl)\//i.test(String(body.model || ''))) {
         const isDahl = /^dahl\//i.test(String(body.model || ''));
-        const realModel = String(body.model).replace(/^(uncloseai|dahl)\//i, '');
-        const upstreamBase = isDahl ? DAHL_BASE : UNCLOSEAI_BASE;
+        const isBlockrun = /^blockrun\//i.test(String(body.model || ''));
+        const realModel = String(body.model).replace(/^(blockrun|uncloseai|dahl)\//i, '');
+        const upstreamBase = isBlockrun ? BLOCKRUN_BASE : (isDahl ? DAHL_BASE : UNCLOSEAI_BASE);
         const uHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
         let ur;
         for (let attempt = 0; attempt < (isDahl ? 2 : 1); attempt++) {

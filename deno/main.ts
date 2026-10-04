@@ -1080,6 +1080,14 @@ export default {
     // /kilo/v1과 같은 원칙(네이티브 엔드포인트, 접두사 없는 모델명)의 UncloseAI/Dahl 전용 라우트.
     // 레거시 /v1/models·/v1/chat/completions의 uncloseai/·dahl/ 접두사 라우팅과 별개로,
     // 클라이언트가 그 프로바이더만 쓰고 싶을 때 접두사 없이 바로 부를 수 있게 한다.
+    if (request.method === 'GET' && pathname === '/blockrun/v1/models') {
+      try {
+        const models = await getBlockrunModels();
+        const data = models.map((m: any) => ({ ...m, id: String(m.id).replace(/^blockrun\//, '') }));
+        return json({ object: 'list', data });
+      } catch (e) { return json({ error: { message: e.message } }, 502); }
+    }
+
     if (request.method === 'GET' && pathname === '/uncloseai/v1/models') {
       try {
         const models = await getUncloseaiModels();
@@ -1156,6 +1164,7 @@ export default {
         try { data = data.concat(await getKiloFreeModels()); } catch {}
         // uncloseai/dahl은 kilo/zen 키 체계와 무관하게 항상 무인증으로 동작하므로 항상 추가한다.
         try { data = data.concat(await getUncloseaiModels()); } catch {}
+        try { data = data.concat(await getBlockrunModels()); } catch {}
         try { data = data.concat(await getDahlModels()); } catch {}
         data.sort((a, b) => a.id.localeCompare(b.id));
         return json({ object: 'list', data });

@@ -289,17 +289,37 @@ function synthesizeOpencodeId(prefix) {
 //     같은 id를 공유하게 한다(실제 CLI/9router PR #4723의 deriveRequestId와 동일 개념).
 // 랜덤 fallback을 남겨두는 이유: session-id 단위로 합산이 강화돼 막히는 경우가
 // 생기면 환경변수 ZEN_SESSION_MODE=random 하나로 원래 동작으로 되돌릴 수 있다.
+// 2026-10-24 (9router PR #4791): zen은 ses_ id의 hex 12자가 실제 CLI의
+// "inverted timestamp" 인코딩인지 검사한다 — hex 12자 = ~(ms*4096 + counter)의
+// 하위 48비트. sha256/랜덤 비트로 만든 id는 정규식은 통과해도 이 디코딩 검사에서
+// 실패해 403 FreeTierError가 난다(PR #4791 작성자가 실 zen에 실측 확인).
+// 그래서 세션 id는 canonical 방식(반전 타임스탬프 hex + base62 꼬리)으로 발급하고,
+// 일 단위 고정/키 단위 고정은 "발급된 canonical id를 캐시"하는 방식으로 유지한다.
+const ZEN_TS_MASK = (1n << 48n) - 1n;
+let zenIdCounter = 0;
+function canonicalSessionId() {
+  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter++ % 4096);
+  const inverted = (~units) & ZEN_TS_MASK;
+  const hexPart = inverted.toString(16).padStart(12, '0');
+  const digest = crypto.randomBytes(14);
+  let b62Part = '';
+  for (const byte of digest) b62Part += ZEN_B62[byte % 62];
+  return 'ses_' + hexPart + b62Part;
+}
 const ZEN_SESSION_MODE = process.env.ZEN_SESSION_MODE || 'stable'; // 'stable' | 'random'
 let zenAnonSession = null; // { id: string, day: string }
+const zenKeySessionCache = new Map(); // keyHash -> canonical session id (프로세스 수명 동안 고정)
 function sessionIdFor(zenApiKey) {
-  if (ZEN_SESSION_MODE === 'random') return synthesizeOpencodeId('ses_');
+  if (ZEN_SESSION_MODE === 'random') return canonicalSessionId();
   const day = new Date().toISOString().slice(0, 10); // UTC 일 단위
   if (zenApiKey) {
-    const keyHash = crypto.createHash('sha256').update(String(zenApiKey)).digest();
-    return opencodeIdFromDigest('ses_', Buffer.from(keyHash).subarray(0, 20));
+    const keyHash = crypto.createHash('sha256').update(String(zenApiKey)).digest('hex').slice(0, 16);
+    let id = zenKeySessionCache.get(keyHash);
+    if (!id) { id = canonicalSessionId(); zenKeySessionCache.set(keyHash, id); }
+    return id;
   }
   if (!zenAnonSession || zenAnonSession.day !== day) {
-    zenAnonSession = { id: synthesizeOpencodeId('ses_'), day };
+    zenAnonSession = { id: canonicalSessionId(), day };
   }
   return zenAnonSession.id;
 }

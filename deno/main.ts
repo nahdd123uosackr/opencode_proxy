@@ -133,16 +133,29 @@ function synthesizeOpencodeId(prefix: string): string {
 // 요청 id는 sha256(sessionId + 마지막 user 메시지)로 결정론적 생성 — 재시도가 같은
 // id를 공유해 쿼터를 중복 소모하지 않게 한다(실제 CLI/9router PR #4723과 동일 개념).
 // 이상 징후 시 Deno.env ZEN_SESSION_MODE=random 으로 요청마다 랜덤 id 동작으로 복귀 가능.
+// 2026-10-24 (9router PR #4791): zen은 ses_ id의 hex 12자가 inverted timestamp
+// (~(ms*4096+counter)의 하위 48비트)인지 검사한다 — 랜덤/해시 비트는 403.
+// canonical 방식으로 발급하고 일 단위 고정은 캐시로 유지. 상세는 api/index.js 주석 참고.
+let zenIdCounter = 0;
+function canonicalSessionId(): string {
+  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter++ % 4096);
+  const inverted = ~units & ((1n << 48n) - 1n);
+  const hexPart = inverted.toString(16).padStart(12, '0');
+  const digest = crypto.getRandomValues(new Uint8Array(14));
+  let b62Part = '';
+  for (const byte of digest) b62Part += ZEN_B62[byte % 62];
+  return 'ses_' + hexPart + b62Part;
+}
 const ZEN_SESSION_MODE = (() => { try { return Deno.env.get('ZEN_SESSION_MODE') || 'stable'; } catch { return 'stable'; } })();
 let zenAnonSession: { id: string; day: string } | null = null;
 async function sha256Digest(text: string): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
 }
 async function sessionIdFor(): Promise<string> {
-  if (ZEN_SESSION_MODE === 'random') return synthesizeOpencodeId('ses_');
+  if (ZEN_SESSION_MODE === 'random') return canonicalSessionId();
   const day = new Date().toISOString().slice(0, 10);
   if (!zenAnonSession || zenAnonSession.day !== day) {
-    zenAnonSession = { id: synthesizeOpencodeId('ses_'), day };
+    zenAnonSession = { id: canonicalSessionId(), day };
   }
   return zenAnonSession.id;
 }

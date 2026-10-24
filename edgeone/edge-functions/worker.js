@@ -32,11 +32,22 @@ function opencodeIdFromDigest(prefix, digest) {
 function synthesizeOpencodeId(prefix) {
   return opencodeIdFromDigest(prefix, crypto.getRandomValues(new Uint8Array(32)));
 }
+// 2026-10-24 (9router PR #4791): zen은 ses_의 hex 12자가 inverted timestamp인지 검사.
+let zenIdCounter = 0;
+function canonicalSessionId() {
+  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter++ % 4096);
+  const inverted = ~units & ((1n << 48n) - 1n);
+  const hexPart = inverted.toString(16).padStart(12, '0');
+  const digest = crypto.getRandomValues(new Uint8Array(14));
+  let b62Part = '';
+  for (const byte of digest) b62Part += ZEN_B62[byte % 62];
+  return 'ses_' + hexPart + b62Part;
+}
 let zenAnonSession = null; // { id, day }
 async function zenSessionId() {
   const day = new Date().toISOString().slice(0, 10);
   if (!zenAnonSession || zenAnonSession.day !== day) {
-    zenAnonSession = { id: synthesizeOpencodeId('ses_'), day };
+    zenAnonSession = { id: canonicalSessionId(), day };
   }
   return zenAnonSession.id;
 }

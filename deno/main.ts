@@ -118,20 +118,70 @@ function pickUA() {
 // P33 (2026-09-30): api/index.js와 동일 — UA는 /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/ 를 통과해야
 // 하고(major>1 또는 1.17+), 세션/메시지 ID는 prefix + hex 12자 + base62 14자 형식이어야 한다.
 const ZEN_B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-function synthesizeOpencodeId(prefix: string): string {
-  const digest = crypto.getRandomValues(new Uint8Array(32));
+function opencodeIdFromDigest(prefix: string, digest: Uint8Array): string {
   let hexPart = '';
   for (const byte of digest.subarray(0, 6)) hexPart += byte.toString(16).padStart(2, '0');
   let b62Part = '';
   for (const byte of digest.subarray(6, 20)) b62Part += ZEN_B62[byte % 62];
   return prefix + hexPart + b62Part;
 }
+function synthesizeOpencodeId(prefix: string): string {
+  return opencodeIdFromDigest(prefix, crypto.getRandomValues(new Uint8Array(32)));
+}
+// api/index.js와 동일 정책(2026-10-24): zen이 무료 쿼터를 session(+IP) 단위로 집행한다는
+// 관측(9router #5107, opencode #58205)에 맞춰, 세션 id는 UTC 일 단위로 고정 로테이션하고
+// 요청 id는 sha256(sessionId + 마지막 user 메시지)로 결정론적 생성 — 재시도가 같은
+// id를 공유해 쿼터를 중복 소모하지 않게 한다(실제 CLI/9router PR #4723과 동일 개념).
+// 이상 징후 시 Deno.env ZEN_SESSION_MODE=random 으로 요청마다 랜덤 id 동작으로 복귀 가능.
+const ZEN_SESSION_MODE = (() => { try { return Deno.env.get('ZEN_SESSION_MODE') || 'stable'; } catch { return 'stable'; } })();
+let zenAnonSession: { id: string; day: string } | null = null;
+async function sha256Digest(text: string): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+}
+async function sessionIdFor(): Promise<string> {
+  if (ZEN_SESSION_MODE === 'random') return synthesizeOpencodeId('ses_');
+  const day = new Date().toISOString().slice(0, 10);
+  if (!zenAnonSession || zenAnonSession.day !== day) {
+    zenAnonSession = { id: synthesizeOpencodeId('ses_'), day };
+  }
+  return zenAnonSession.id;
+}
+async function requestIdFor(sessionId: string, upstreamBody?: unknown): Promise<string> {
+  if (ZEN_SESSION_MODE === 'random' || upstreamBody === undefined) return synthesizeOpencodeId('msg_');
+  const text = extractLastUserText(upstreamBody);
+  return opencodeIdFromDigest('msg_', await sha256Digest(sessionId + '|' + text));
+}
+function extractLastUserText(body: any): string {
+  const parts: string[] = [];
+  const collect = (c: any) => {
+    if (typeof c === 'string') { parts.push(c); return; }
+    if (Array.isArray(c)) for (const p of c) {
+      if (typeof p === 'string') parts.push(p);
+      else if (p && typeof p === 'object') parts.push(p.text ?? p.content ?? p.input_text ?? '');
+    }
+  };
+  const msgs = Array.isArray(body && body.messages) ? body.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === 'user') { collect(msgs[i].content); return parts.join(''); }
+  }
+  const input = body && body.input;
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i--) {
+      const it = input[i];
+      if (it && (it.role === 'user' || it.type === 'message')) { collect(it.content ?? it.text ?? ''); return parts.join(''); }
+    }
+  }
+  return '';
+}
 const ZEN_UA = 'opencode/1.18.31';
-function injectHeaders(headers) {
+// injectHeaders가 async가 됐다 — 호출부는 모두 await 해야 한다.
+async function injectHeaders(headers, upstreamBody?: unknown) {
   const h = { ...headers };
+  const sessionId = await sessionIdFor();
   h['User-Agent'] = ZEN_UA;
-  h['x-opencode-session'] = synthesizeOpencodeId('ses_');
-  h['x-opencode-request'] = synthesizeOpencodeId('msg_');
+  h['x-opencode-session'] = sessionId;
+  h['x-opencode-request'] = await requestIdFor(sessionId, upstreamBody);
   h['x-opencode-client'] = 'desktop';
   h['x-opencode-project'] = 'global';
   return h;
@@ -808,7 +858,7 @@ async function museChatResponse(upstreamModel, bodyObj, variant, isStream) {
     stream: isFreeTier ? true : !!isStream,
     metadata: { _nonce: crypto.randomUUID().slice(0, 12) },
   };
-  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' });
+  const headers = await injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' }, rbody);
   const r = await fetch(UPSTREAM + '/responses', { method: 'POST', headers, body: JSON.stringify(rbody) });
   if (!r.ok) return forwardStreamOrJson(r, false);
   if (isStream) return new Response(responsesSSEToChatStream(r.body), { status: 200, headers: { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });
@@ -822,7 +872,7 @@ async function museChatResponse(upstreamModel, bodyObj, variant, isStream) {
 }
 
 async function forward(path, bodyObj, isStream) {
-  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+  const headers = await injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, bodyObj);
   return fetch(UPSTREAM + path, { method: 'POST', headers, body: JSON.stringify(bodyObj) });
 }
 async function forwardStreamOrJson(upstreamRes, isStream) {
@@ -854,7 +904,7 @@ export default {
     // 구조적으로 발생할 수 없다.
     if (request.method === 'GET' && (pathname === '/res/v1/models' || pathname === '/chat/v1/models' || pathname === '/mes/v1/models')) {
       try {
-        const headers = injectHeaders({ 'Content-Type': 'application/json' });
+        const headers = await injectHeaders({ 'Content-Type': 'application/json' });
         const fr = await fetch(UPSTREAM + '/models', { method: 'GET', headers });
         if (!fr.ok) {
           const text = await fr.text();
@@ -903,7 +953,7 @@ export default {
       let pbody; try { pbody = JSON.parse(rawText || '{}'); } catch { return json({ error: { message: 'Invalid JSON' } }, 400); }
       if (!pbody.model) return json({ error: { message: 'model required' } }, 400);
       const isStream = !!pbody.stream;
-      const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+      const headers = await injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, pbody);
       // /res/v1/responses는 순수 passthrough(바디 무변형)가 원칙이지만, muse 계열에서 100% 확정적으로
       // 실패하는 두 가지 케이스만 최소 개입으로 방어한다(res/chat/mes 설계 원칙과 같은 성격의 예외, P24/P28):
       let outText = rawText;
@@ -1266,7 +1316,7 @@ export default {
           }
           let ub = applyMuseDefaults({ ...body, model: upstreamModel }, 'responses');
           ub.metadata = Object.assign({}, ub.metadata, { _nonce: crypto.randomUUID().slice(0, 12) });
-          const r2 = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }), body: JSON.stringify(ub) });
+          const r2 = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: await injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, ub), body: JSON.stringify(ub) });
           if (isStream && r2.ok) return new Response(r2.body, { status: 200, headers: { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Cache-Control': 'no-store' } });
           return new Response(await r2.text(), { status: r2.status, headers: { ...CORS, 'Content-Type': r2.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' } });
         }
@@ -1323,7 +1373,7 @@ export default {
           const kBody = { ...full, model: String(full.model).replace(/^kilo\//i, '') };
           delete kBody.reasoning_effort; delete kBody.reasoningEffort;
           if (variant && !String(kBody.model).includes(':')) kBody.model += ':' + variant;
-          const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: injectHeaders({ 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' }), body: JSON.stringify(kBody) });
+          const kr = await fetch(KILO_BASE + '/chat/completions', { method: 'POST', headers: await injectHeaders({ 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' }), body: JSON.stringify(kBody) });
           r = new Response(await kr.text(), { status: kr.status, headers: { 'Content-Type': kr.headers.get('content-type') || 'application/json' } });
         } else if (isMuse) {
           // P21-fix (2026-09-11): muse-spark는 /chat/completions를 지원하지 않아

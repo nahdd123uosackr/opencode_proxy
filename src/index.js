@@ -16,11 +16,68 @@ function pickUA() {
   ];
   return pool[0];
 }
-function injectHeaders(headers) {
+// 2026-10-24: api/index.js(메인)와 동일한 zen 헤더 계약으로 갱신 — 이 파일은 P33 이전
+// 코드(Chrome UA + 접두사 없는 hex 세션)라 zen 무료 게이트 자체를 통과 못 했다.
+// 세션 id는 UTC 일 단위 고정, 요청 id는 sha256(sessionId + 마지막 user 메시지)로
+// 결정론적 생성해 재시도가 같은 id를 공유한다(session 단위 쿼터 집행 대응, 상세 근거는
+// api/index.js 주석 참고). Workers WebCrypto 사용.
+const ZEN_B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+function opencodeIdFromDigest(prefix, digest) {
+  let hexPart = '';
+  for (const byte of digest.subarray(0, 6)) hexPart += byte.toString(16).padStart(2, '0');
+  let b62Part = '';
+  for (const byte of digest.subarray(6, 20)) b62Part += ZEN_B62[byte % 62];
+  return prefix + hexPart + b62Part;
+}
+function synthesizeOpencodeId(prefix) {
+  return opencodeIdFromDigest(prefix, crypto.getRandomValues(new Uint8Array(32)));
+}
+let zenAnonSession = null; // { id, day }
+async function zenSessionId() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (!zenAnonSession || zenAnonSession.day !== day) {
+    zenAnonSession = { id: synthesizeOpencodeId('ses_'), day };
+  }
+  return zenAnonSession.id;
+}
+function extractLastUserText(body) {
+  const parts = [];
+  const collect = (c) => {
+    if (typeof c === 'string') { parts.push(c); return; }
+    if (Array.isArray(c)) for (const p of c) {
+      if (typeof p === 'string') parts.push(p);
+      else if (p && typeof p === 'object') parts.push(p.text ?? p.content ?? p.input_text ?? '');
+    }
+  };
+  const msgs = Array.isArray(body && body.messages) ? body.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === 'user') { collect(msgs[i].content); return parts.join(''); }
+  }
+  const input = body && body.input;
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i--) {
+      const it = input[i];
+      if (it && (it.role === 'user' || it.type === 'message')) { collect(it.content ?? it.text ?? ''); return parts.join(''); }
+    }
+  }
+  return '';
+}
+const ZEN_UA = 'opencode/1.18.31';
+// async가 됐다 — 호출부에서 await 필요.
+async function injectHeaders(headers, upstreamBody) {
   const h = { ...headers };
-  h['User-Agent'] = pickUA();
-  h['x-opencode-session'] = crypto.randomUUID().replace(/-/g, '');
-  h['x-opencode-client'] = 'opencode-free-pool-cf';
+  const sessionId = await zenSessionId();
+  h['User-Agent'] = ZEN_UA;
+  h['x-opencode-session'] = sessionId;
+  if (upstreamBody === undefined) {
+    h['x-opencode-request'] = synthesizeOpencodeId('msg_');
+  } else {
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sessionId + '|' + extractLastUserText(upstreamBody))));
+    h['x-opencode-request'] = opencodeIdFromDigest('msg_', digest);
+  }
+  h['x-opencode-client'] = 'desktop';
+  h['x-opencode-project'] = 'global';
   return h;
 }
 function authOk(request, env) {
@@ -95,7 +152,7 @@ function applyVariant(upstreamBody, variant) {
 }
 
 async function forward(path, bodyObj, isStream) {
-  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' });
+  const headers = await injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, bodyObj);
   return fetch(UPSTREAM + path, { method: 'POST', headers, body: JSON.stringify(bodyObj) });
 }
 async function forwardStreamOrJson(upstreamRes, isStream) {

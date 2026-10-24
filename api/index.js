@@ -271,22 +271,78 @@ function isOpenCodeZenKey(key) {
 // 세션/메시지 ID 형식: `<prefix>` + sha256(또는 random 32B)의 앞 6바이트를 hex로,
 // 이어지는 14바이트를 base62로 인코딩한 문자열. 정규식: /^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 const ZEN_B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-function synthesizeOpencodeId(prefix) {
-  const digest = crypto.randomBytes(32);
-  const hexPart = digest.subarray(0, 6).toString('hex');
+function opencodeIdFromDigest(prefix, digest) {
+  const hexPart = Buffer.from(digest.subarray(0, 6)).toString('hex');
   let b62Part = '';
   for (const byte of digest.subarray(6, 20)) b62Part += ZEN_B62[byte % 62];
   return prefix + hexPart + b62Part;
+}
+function synthesizeOpencodeId(prefix) {
+  return opencodeIdFromDigest(prefix, crypto.randomBytes(32));
+}
+// zen이 무료 쿼터를 session(+IP) 단위로 집행한다는 관측이 있다(9router #5107,
+// opencode #58205 참고). 요청마다 세션을 새로 만들면 재시도/후속턴이 전부 새 쿼터
+// 버킷으로 들어가 사용량이 분산·중복 집계되고 비정상 패턴으로도 보인다. 그래서:
+//   - 세션 id: 인증 주체(zenApiKey) 단위로 고정하고, 익명(free tier) 요청은
+//     24시간 윈도우로 로테이션한다. 실제 CLI의 "세션 시작→하루 리셋" 동작 흉내.
+//   - 요청 id: sha256(sessionId + 마지막 user 메시지)로 결정론적 생성해 재시도가
+//     같은 id를 공유하게 한다(실제 CLI/9router PR #4723의 deriveRequestId와 동일 개념).
+// 랜덤 fallback을 남겨두는 이유: session-id 단위로 합산이 강화돼 막히는 경우가
+// 생기면 환경변수 ZEN_SESSION_MODE=random 하나로 원래 동작으로 되돌릴 수 있다.
+const ZEN_SESSION_MODE = process.env.ZEN_SESSION_MODE || 'stable'; // 'stable' | 'random'
+let zenAnonSession = null; // { id: string, day: string }
+function sessionIdFor(zenApiKey) {
+  if (ZEN_SESSION_MODE === 'random') return synthesizeOpencodeId('ses_');
+  const day = new Date().toISOString().slice(0, 10); // UTC 일 단위
+  if (zenApiKey) {
+    const keyHash = crypto.createHash('sha256').update(String(zenApiKey)).digest();
+    return opencodeIdFromDigest('ses_', Buffer.from(keyHash).subarray(0, 20));
+  }
+  if (!zenAnonSession || zenAnonSession.day !== day) {
+    zenAnonSession = { id: synthesizeOpencodeId('ses_'), day };
+  }
+  return zenAnonSession.id;
+}
+function requestIdFor(sessionId, upstreamBody) {
+  if (ZEN_SESSION_MODE === 'random' || upstreamBody === undefined) return synthesizeOpencodeId('msg_');
+  const text = extractLastUserText(upstreamBody);
+  const digest = crypto.createHash('sha256').update(sessionId + '|' + text).digest();
+  return opencodeIdFromDigest('msg_', digest.subarray(0, 20));
+}
+function extractLastUserText(body) {
+  const parts = [];
+  const collect = (c) => {
+    if (typeof c === 'string') { parts.push(c); return; }
+    if (Array.isArray(c)) for (const p of c) {
+      if (typeof p === 'string') parts.push(p);
+      else if (p && typeof p === 'object') parts.push(p.text ?? p.content ?? p.input_text ?? '');
+    }
+  };
+  const msgs = Array.isArray(body && body.messages) ? body.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === 'user') { collect(msgs[i].content); return parts.join(''); }
+  }
+  // Responses API 형식: input이 문자열이거나 아이템 배열
+  const input = body && body.input;
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i--) {
+      const it = input[i];
+      if (it && (it.role === 'user' || it.type === 'message')) { collect(it.content ?? it.text ?? ''); return parts.join(''); }
+    }
+  }
+  return '';
 }
 // 실측 정규식(청크 20420.js): /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/i — major>1 이거나
 // (major===1 && minor>=17)이어야 통과. 예전 'opencode/latest/2.0.5/cli'는 'latest'가
 // 숫자가 아니라서 이 매칭 자체가 실패해 게이트를 통과 못 했었다(P33 재발 원인).
 const ZEN_UA = 'opencode/1.18.31';
-function injectHeaders(headers, relay, zenApiKey) {
+function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   const h = { ...headers };
+  const sessionId = sessionIdFor(zenApiKey);
   h['User-Agent'] = ZEN_UA;
-  h['x-opencode-session'] = synthesizeOpencodeId('ses_');
-  h['x-opencode-request'] = synthesizeOpencodeId('msg_');
+  h['x-opencode-session'] = sessionId;
+  h['x-opencode-request'] = requestIdFor(sessionId, upstreamBody);
   h['x-opencode-client'] = 'desktop';
   h['x-opencode-project'] = 'global';
   if (zenApiKey) {
@@ -371,6 +427,27 @@ function authOk(req) {
 
 function corsHeaders() {
   return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, x-opencode-session' };
+}
+
+const REASONING_PASSBACK_RE = /reasoning_content.{0,40}must be passed back/i;
+
+// stage 1: reasoning_content가 빠진 assistant 메시지에 빈 값을 채워 재시도.
+// stage 2: 그래도 거절하면 thinking 모드 자체를 끄고 history의 reasoning_content를 제거.
+function relaxReasoningPassback(body, stage) {
+  const next = { ...body };
+  const msgs = Array.isArray(body.messages) ? body.messages : [];
+  if (stage === 1) {
+    next.messages = msgs.map(m => (m && m.role === 'assistant' && m.reasoning_content === undefined) ? { ...m, reasoning_content: '' } : m);
+    return next;
+  }
+  next.messages = msgs.map(m => {
+    if (!m || m.role !== 'assistant' || m.reasoning_content === undefined) return m;
+    const { reasoning_content, ...rest } = m;
+    return rest;
+  });
+  delete next.reasoning_effort; delete next.reasoningEffort; delete next.reasoning;
+  next.thinking = { type: 'disabled' };
+  return next;
 }
 
 // reasoning 모델이 작은 max_tokens를 추론에 소진하는 것 방지 (공통)
@@ -1178,7 +1255,7 @@ async function museViaResponses(upstreamModel, bodyObj, variant, isStream, zenAp
     stream: isFreeTier ? true : !!isStream,
     metadata: { _nonce: crypto.randomUUID().slice(0, 12) },
   };
-  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+  const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, rbody);
   return fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(rbody) });
 }
 
@@ -1528,7 +1605,7 @@ const handle = async (req, res) => {
       const pre = typeof body.instructions === 'string' && body.instructions ? [{ role: 'system', content: body.instructions }] : [];
       let mb = applyVariant(applyMuseDefaults({ ...body, model: upstreamModel, messages: [...pre, ...conv] }, 'chat'), variant);
       delete mb.input; delete mb.instructions;
-      const headersC = injectHeaders({ 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+      const headersC = injectHeaders({ 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, mb);
       try {
         const fr = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headersC, body: JSON.stringify(mb), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
         res.writeHead(fr.status === 200 ? 200 : fr.status, { 'Content-Type': fr.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
@@ -1569,7 +1646,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       upstreamBody = applyZenFreeTierContract(upstreamBody, 'chat');
     }
 
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey, upstreamBody);
     headers['Cache-Control'] = 'no-store';
 
     try {
@@ -1605,7 +1682,17 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       } else {
         fetchRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       }
-      const bodyText = await fetchRes.text();
+      let bodyText = await fetchRes.text();
+
+      // 클라이언트(omniroute 등)가 이전 assistant 턴의 reasoning_content를 버리고 보내면 thinking 모드
+      // 모델(DeepSeek 계열)이 400을 낸다. 해당 에러일 때만 단계적으로 완화해 재시도한다.
+      for (let stage = 1; stage <= 2 && fetchRes.status === 400 && REASONING_PASSBACK_RE.test(bodyText); stage++) {
+        console.log(`[reasoning-passback] 400 for ${upstreamModel}, retry stage ${stage}`);
+        upstreamBody = relaxReasoningPassback(upstreamBody, stage);
+        fetchRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+        bodyText = await fetchRes.text();
+      }
+
       let isErrPayload = !fetchRes.ok || (/"error":/i.test(bodyText) && !/"choices":/i.test(bodyText));
 
       if (zenApiKey) {
@@ -1615,7 +1702,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       // If Zen Key failed (AuthError or RateLimit) and we can transparently fallback to free anonymous session:
       if (isErrPayload && zenApiKey && (/AuthError|Invalid API key|FreeUsageLimitError|Rate limit/i.test(bodyText))) {
         console.log(`[Failover] ZenKey failed (${bodyText.slice(0, 80)}), transparently falling back to anonymous session...`);
-        const anonHeaders = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, null);
+        const anonHeaders = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, null, upstreamBody);
         anonHeaders['Cache-Control'] = 'no-store';
         const anonRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: anonHeaders, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
         const anonText = await anonRes.text();
@@ -1688,7 +1775,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       ...(anthToolChoice ? { tool_choice: anthToolChoice } : {})
     };
     openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), effectiveVariant);
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, openReq);
 
     try {
       let fetchRes;
@@ -1811,7 +1898,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       upstreamBody = applyZenFreeTierContract(upstreamBody, 'responses');
     }
 
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey, upstreamBody);
     try {
       let fr = await fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       if (fr.status === 400) {
@@ -1907,7 +1994,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
     const zenApiKey = isZen ? clientKey : null;
     const isStream = !!body.stream;
-    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, null, zenApiKey);
+    const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, body);
     // zen의 /v1/messages는 진짜 Anthropic Messages API 계약을 따라서 Authorization: Bearer가
     // 아니라 x-api-key를 요구한다 (chat/completions, /responses는 Bearer로 정상 동작 확인됨 —
     // mes 전용 케이스). CLIProxyAPI의 claude-api-key 실행기 경유 검증 중 발견 (AuthError: Missing API key).

@@ -301,7 +301,7 @@ let modelsCache = null, modelsCacheTime = 0;
 const MODELS_TTL = 60 * 60 * 1000;
 
 // === Kilo Gateway 프로바이더 (무료 모델만, 인증 불필요) ===
-const KILO_BASE = 'https://api.kilo.ai/api/gateway';
+const KILO_BASE = (() => { try { return Deno.env.get('KILO_BASE') || 'https://ai-gateway.kilo.ai/api/v1'; } catch { return 'https://ai-gateway.kilo.ai/api/v1'; } })();
 let kiloModelsCache = null;
 let kiloModelsCacheTime = 0;
 async function getKiloFreeModels() {

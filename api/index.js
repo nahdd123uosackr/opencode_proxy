@@ -87,7 +87,7 @@ function checkAndMarkResponse(key, status, bodyText) {
 
 
 // === Kilo Gateway 프로바이더 (무료 모델 및 사용자 키 지원) ===
-const KILO_BASE = 'https://api.kilo.ai/api/gateway';
+const KILO_BASE = process.env.KILO_BASE || 'https://ai-gateway.kilo.ai/api/v1';
 let kiloModelsCache = null, kiloModelsCacheTime = 0;
 
 async function getKiloFreeModels() {

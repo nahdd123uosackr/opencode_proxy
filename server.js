@@ -1,12 +1,16 @@
 'use strict';
 const http = require('http');
 const handler = require('./api/index.js');
+const relay = require('./relay.js');
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/zen/v1';
 
 const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
+
+  // WebSocket relay health/guard (only /api/ws; everything else falls through)
+  if (relay.handleHttp(req, res)) return;
 
   // Health check
   if (url === '/health' || url === '/') {
@@ -35,6 +39,8 @@ const server = http.createServer((req, res) => {
 }).listen(PORT, HOST, () => {
   console.log(`opencode-proxy listening on ${HOST}:${PORT}, upstream=${UPSTREAM}`);
 });
+
+relay.attach(server);
 
 // 2026-09-11: server.js never kept a reference to the server, so the SIGTERM
 // handler in api/index.js (shuttingDown=true only) had no way to actually

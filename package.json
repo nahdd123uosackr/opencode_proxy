@@ -9,5 +9,7 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "ws": "8.21.0"
+  }
 }

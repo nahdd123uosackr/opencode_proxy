@@ -900,7 +900,15 @@ export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
     const url = new URL(request.url);
-    const pathname = url.pathname;
+    let pathname = url.pathname;
+
+    // 2026-10-26: api/index.js와 동일 — /opencode/v1/* 접두사 라우트(Kilo/Dahl와 같은 형태).
+    // 게이트웨이가 프로바이더 이름을 경로에 붙여 보내는 경우를 받아주고, 접두사만 벗겨
+    // 기존 /v1/* 처리 경로를 그대로 재사용한다.
+    if (pathname === '/opencode' || pathname.startsWith('/opencode/')) {
+      pathname = pathname.slice('/opencode'.length) || '/';
+      if (!pathname.startsWith('/')) pathname = '/' + pathname;
+    }
 
     if (pathname === '/health' || pathname === '/v1/health') {
       return json({ status: 'ok', upstream: UPSTREAM });

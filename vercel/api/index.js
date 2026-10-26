@@ -1398,7 +1398,17 @@ const handle = async (req, res) => {
   for (const [k, v] of Object.entries(corsHeaders())) res.setHeader(k, v);
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, `https://${req.headers.host}`);
-  const pathname = url.pathname;
+  let pathname = url.pathname;
+
+  // 2026-10-26: /opencode/v1/* 전용 접두사 라우트. Kilo(/kilo/v1/*), Dahl(/dahl/v1/*)와 같은
+  // 형태로, 게이트웨이가 프로바이더 이름을 경로 접두사로 붙여 보내는 클라이언트
+  // (예: OmniRoute의 opencode-key-chat 프로바이더)를 받아준다. 접두사만 벗겨서
+  // 기존 /v1/* 처리 경로를 그대로 재사용한다 — zen 전용 동작(무료 티어 계약,
+  // 프로토콜 분기, 모델 판별)을 중복 구현하지 않기 위해서다.
+  if (pathname === '/opencode' || pathname.startsWith('/opencode/')) {
+    pathname = pathname.slice('/opencode'.length) || '/';
+    if (!pathname.startsWith('/')) pathname = '/' + pathname;
+  }
 
   if (pathname === '/health' || pathname === '/v1/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -1130,107 +1130,73 @@ async function pumpResponsesSSEToAnthropic(body, aw) {
 }
 
 const KNOWN_FREE_EXTRA = new Set(['big-pickle', 'grok-code']);
-// P29/P30 (2026-09-12): zen /models 응답 자체엔 엔드포인트 호환성 메타데이터가 없다(id/object/created/
-// owned_by뿐). 처음엔 "claude-*=messages, muse-spark*=responses, 나머지=chat" 이름 패턴으로 분류했는데,
-// opencode 공식 문서(zen.mdx의 "Endpoints" 표)를 실제로 대조해보니 qwen*도 messages 전용이고 gemini-*는
-// 셋 중 어디에도 안 속하는 별도 포맷(`/v1/models/{id}`, Google 네이티브)이었다 — 이 프로젝트가 가진 키는
-// 전부 무결제라 qwen/gemini(둘 다 유료 전용, free 버전 없음)는 애초에 무료 필터에서 걸러져 이 오분류가
-// 실사용엔 영향 없었지만, 정확한 근거로 바꾼다. zen.mdx 원본(마크다운 파이프 테이블, JS 렌더링 불필요)을
-// fetch해서 파싱하고, 표에 없는 새 모델(문서가 API보다 며칠 뒤처질 수 있음 — 실제로 이 표엔
-// muse-spark-1.2-contributor-free/deepseek-v4-flash-free가 빠져 있었다)에 한해서만 기존 이름 패턴
-// 휴리스틱으로 폴백한다. 문서 fetch/파싱 자체가 실패하면 전부 휴리스틱으로 폴백.
-const ZEN_DOCS_URL = 'https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx';
-const ZEN_ENDPOINT_MAP_TTL = 6 * 60 * 60 * 1000; // 문서는 자주 안 바뀌므로 6시간
-let zenEndpointMapCache = null, zenEndpointMapCacheTime = 0;
+// 2026-10-26: zen.mdx(공식 문서)는 2026-10-12 커밋 25053bbdc("replace old Zen and Go pages with V2 console
+// docs")로 저장소에서 삭제돼 raw URL이 404가 됐다. 그 뒤로 Endpoints 표와 "The free models:" 목록 파싱이 계속
+// 실패해 이름 패턴 휴리스틱과 하드코딩 목록으로만 동작했다. 같은 사실(모델별 프로토콜, 무료 여부, deprecated)을
+// 정품 CLI가 스스로 읽는 카탈로그(models.opencode.ai/api.json)에서 얻는다:
+//   무료       = cost.input === 0 && cost.output === 0  (deprecated 제외)
+//   deprecated = status === 'deprecated'
+//   프로토콜   = provider.npm: @ai-sdk/anthropic -> messages, @ai-sdk/openai -> responses,
+//                @ai-sdk/google -> gemini-native, 그 외(npm 없음, mistral 등) -> chat
+// 카탈로그에 없는 모델(신규 모델 등)은 deprecated로 취급하지 않는다 — 목록에 없다고 폐기된 것은 아니다.
+// 카탈로그 fetch가 실패하면 마지막으로 성공한 값을 계속 쓰고, 처음부터 없으면 null(=이름 패턴 휴리스틱 + 하드코딩 폴백).
+const ZEN_CATALOG_URL = process.env.ZEN_CATALOG_URL || 'https://models.opencode.ai/api.json';
+const ZEN_CATALOG_TTL = 6 * 60 * 60 * 1000;
+const ZEN_CATALOG_RETRY_MS = 60 * 1000; // 실패 직후 매 요청마다 8초 타임아웃을 반복하지 않도록
+let zenCatalogCache = null, zenCatalogCacheTime = 0, zenCatalogFailUntil = 0, zenCatalogInflight = null;
 
-// zen.mdx의 Endpoints 표를 파싱하되, 이번엔 Model(표시명) 컬럼도 함께 뽑는다 —
-// "The free models:" 목록(아래 getZenFreeModelSet)이 표시명 기준이라, 표시명→ID로
-// 조인해야 실제 API에 쓰는 model id를 얻을 수 있다. 표시명과 ID 둘 다 캡처하도록
-// 확장한 것 외엔 기존 getZenEndpointMap(P29/P30)과 동일 파싱 로직.
-async function parseZenEndpointsTable(text) {
-  const m = text.match(/## Endpoints\n[\s\S]*?\n\| *Model[^\n]*\n\|[-\s|]+\n([\s\S]*?)\n\n/);
-  if (!m) throw new Error('endpoint table not found in zen.mdx (markup changed?)');
-  const map = {}; // id -> endpoint 'chat'|'responses'|'messages'|'gemini-native'
-  const displayNameToId = {}; // 'Muse Spark 1.3 Contributor Free' -> 'muse-spark-1.3-contributor-free'
-  for (const line of m[1].split('\n')) {
-    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
-    if (cells.length < 3 || !cells[1]) continue;
-    const displayName = cells[0];
-    const id = cells[1];
-    const endpointUrl = cells[2].replace(/`/g, '');
-    if (endpointUrl.endsWith('/v1/responses')) map[id] = 'responses';
-    else if (endpointUrl.endsWith('/v1/chat/completions')) map[id] = 'chat';
-    else if (endpointUrl.endsWith('/v1/messages')) map[id] = 'messages';
-    else if (/\/v1\/models\//.test(endpointUrl)) map[id] = 'gemini-native';
-    if (displayName) displayNameToId[displayName] = id;
-  }
-  if (Object.keys(map).length < 10) throw new Error('parsed suspiciously few rows (' + Object.keys(map).length + ')');
-  return { map, displayNameToId };
+function zenProtocolFromCatalog(provider) {
+  const npm = String((provider && provider.npm) || '');
+  const api = String((provider && provider.api) || '');
+  if (/anthropic/i.test(npm) || /\/anthropic\//.test(api)) return 'messages';
+  if (/google/i.test(npm) || /\/google\//.test(api)) return 'gemini-native';
+  if (npm === '@ai-sdk/openai') return 'responses';
+  return 'chat';
 }
 
-async function getZenEndpointMap() {
-  const now = Date.now();
-  if (zenEndpointMapCache && (now - zenEndpointMapCacheTime) < ZEN_ENDPOINT_MAP_TTL) return zenEndpointMapCache;
-  try {
-    const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
-    if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
-    const text = await r.text();
-    const { map } = await parseZenEndpointsTable(text);
-    zenEndpointMapCache = map;
-    zenEndpointMapCacheTime = now;
-    return map;
-  } catch (e) {
-    console.warn('[zen-endpoint-map] fetch/parse failed, falling back to name-pattern heuristic for all models:', e.message);
-    return null;
+function parseZenCatalog(json) {
+  const models = json && json.opencode && json.opencode.models;
+  if (!models || typeof models !== 'object') throw new Error('catalog has no opencode.models');
+  const protocols = {}, free = new Set(), deprecated = new Set();
+  for (const [id, m] of Object.entries(models)) {
+    if (!m || typeof m !== 'object') continue;
+    protocols[id] = zenProtocolFromCatalog(m.provider);
+    const isDeprecated = m.status === 'deprecated';
+    if (isDeprecated) deprecated.add(id);
+    const c = m.cost;
+    if (!isDeprecated && c && c.input === 0 && c.output === 0) free.add(id);
   }
+  if (Object.keys(protocols).length < 10) throw new Error('parsed suspiciously few catalog models (' + Object.keys(protocols).length + ')');
+  return { protocols, free, deprecated };
 }
 
-// P34 (2026-09-30): zen.mdx의 "The free models:" 불릿 리스트(Pricing 섹션 하단)를
-// 파싱해서 실제 무료 model id 집합을 동적으로 가져온다. 지금까지는 ZEN_KNOWN_FREE_MODELS
-// 같은 하드코딩 Set으로 관리했는데, zen이 새 무료 모델을 추가/제거할 때마다 코드를
-// 수동으로 고쳐야 했다 — 실제로 muse-spark-1.2-contributor-free/deepseek-v4-flash-free가
-// Endpoints 표에서 누락돼 있던 사례(P29/P30 주석)처럼 문서 자체도 API보다 뒤처질 수
-// 있으므로, 이 동적 목록은 항상 하드코딩 폴백 Set과 합집합으로 쓴다(폴백을 대체하지 않음).
-//
-// 포맷(실측, 2026-09-30):
-//   The free models:
-//
-//   - MiMo-V2.6-Flash Free is available on OpenCode for a limited time. ...
-//   - Big Pickle is a stealth model that's free on OpenCode for a limited time.
-//   ...
-// 각 불릿의 맨 앞부분이 Endpoints 표의 Model(표시명) 컬럼과 정확히 일치하는 문자열이다
-// (실측 확인: "Muse Spark 1.3 Contributor Free"가 두 곳에서 토씨 하나 안 틀리고 동일).
-// 표시명을 통째로 알아내려면 문장 전체를 파싱해야 하므로, displayNameToId의 키들을
-// 각 불릿 라인이 "그 키로 시작하는지"로 매칭한다(가장 긴 키 우선 — 부분 문자열 오매칭 방지).
-const ZEN_FREE_MODEL_SET_TTL = 6 * 60 * 60 * 1000;
-let zenFreeModelSetCache = null, zenFreeModelSetCacheTime = 0;
-async function getZenFreeModelSet() {
+async function getZenCatalog() {
   const now = Date.now();
-  if (zenFreeModelSetCache && (now - zenFreeModelSetCacheTime) < ZEN_FREE_MODEL_SET_TTL) return zenFreeModelSetCache;
-  try {
-    const r = await fetch(ZEN_DOCS_URL, { signal: AbortSignal.timeout(5000) });
-    if (!r.ok) throw new Error('zen.mdx fetch failed: HTTP ' + r.status);
-    const text = await r.text();
-    const { displayNameToId } = await parseZenEndpointsTable(text);
-    const listMatch = text.match(/The free models:\n\n([\s\S]*?)\n\n/);
-    if (!listMatch) throw new Error('"The free models:" list not found in zen.mdx (markup changed?)');
-    const displayNamesByLengthDesc = Object.keys(displayNameToId).sort((a, b) => b.length - a.length);
-    const ids = new Set();
-    for (const line of listMatch[1].split('\n')) {
-      const bullet = line.trim().replace(/^-\s*/, '');
-      if (!bullet) continue;
-      const matchedName = displayNamesByLengthDesc.find((name) => bullet.startsWith(name));
-      if (matchedName) ids.add(displayNameToId[matchedName]);
+  if (zenCatalogCache && (now - zenCatalogCacheTime) < ZEN_CATALOG_TTL) return zenCatalogCache;
+  if (now < zenCatalogFailUntil) return zenCatalogCache; // 최근 실패: 마지막 성공값(없으면 null)
+  if (zenCatalogInflight) return zenCatalogInflight;
+  zenCatalogInflight = (async () => {
+    try {
+      const r = await fetch(ZEN_CATALOG_URL, { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) throw new Error('catalog fetch failed: HTTP ' + r.status);
+      zenCatalogCache = parseZenCatalog(await r.json());
+      zenCatalogCacheTime = Date.now();
+      zenCatalogFailUntil = 0;
+    } catch (e) {
+      zenCatalogFailUntil = Date.now() + ZEN_CATALOG_RETRY_MS;
+      console.warn('[zen-catalog] fetch/parse failed, ' + (zenCatalogCache ? 'keeping the last good catalog' : 'falling back to name-pattern heuristic + hardcoded free list') + ':', e.message);
+    } finally {
+      zenCatalogInflight = null;
     }
-    if (ids.size < 5) throw new Error('parsed suspiciously few free models (' + ids.size + ')');
-    zenFreeModelSetCache = ids;
-    zenFreeModelSetCacheTime = now;
-    return ids;
-  } catch (e) {
-    console.warn('[zen-free-model-set] fetch/parse failed, falling back to hardcoded list only:', e.message);
-    return null;
-  }
+    return zenCatalogCache;
+  })();
+  return zenCatalogInflight;
 }
+
+// 호출부는 그대로 두기 위해 기존 함수 이름을 유지한다.
+async function getZenEndpointMap() { const c = await getZenCatalog(); return c ? c.protocols : null; }
+async function getZenFreeModelSet() { const c = await getZenCatalog(); return c ? c.free : null; }
+async function getZenDeprecatedSet() { const c = await getZenCatalog(); return c ? c.deprecated : null; }
 
 const MUSE_MODEL_RE = /^muse-spark/i;
 const CLAUDE_MODEL_RE = /^claude-/i;
@@ -1314,7 +1280,9 @@ async function getFreeModelsExpanded() {
     rawIds = arr.map(m => m.id).filter(Boolean);
   } catch (e) { console.error('[models] upstream fail', e.message); }
   if (!rawIds.length) rawIds = ['muse-spark-1.2-contributor-free', 'hy3-free', 'x-preview-f-free', 'big-pickle', 'grok-code'];
-  const freeIds = rawIds.filter(id => id.endsWith('-free') || KNOWN_FREE_EXTRA.has(id));
+  // 2026-10-26: 카탈로그가 deprecated로 표시한 모델은 목록에 노출하지 않는다(카탈로그를 못 받으면 필터 없이 기존 동작).
+  const deprecatedIds = await getZenDeprecatedSet();
+  const freeIds = rawIds.filter(id => (id.endsWith('-free') || KNOWN_FREE_EXTRA.has(id)) && !(deprecatedIds && deprecatedIds.has(id)));
   const nowSec = Math.floor(now / 1000);
   const expanded = [];
   for (const id of freeIds) {
@@ -1980,10 +1948,12 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       // 목록을 반환해서 클라이언트가 실제로 동작 안 하는 엔드포인트의 모델을 골라버리는 문제가 있었다.
       // 분류는 zen 공식 문서(zen.mdx)에서 동적으로 가져오고, 문서에 없는 모델만 이름 패턴으로 폴백한다.
       const endpointMap = await getZenEndpointMap();
+      const deprecatedIds = await getZenDeprecatedSet();
       const upstreamJson = await fr.json();
       const filtered = Array.isArray(upstreamJson.data)
         ? upstreamJson.data.filter(m => {
             if (!m || !m.id || !(m.id.endsWith('-free') || KNOWN_FREE_EXTRA.has(m.id))) return false;
+            if (deprecatedIds && deprecatedIds.has(m.id)) return false; // deprecated 모델 제외
             const proto = classifyZenModelProtocol(m.id, endpointMap);
             if (pathname === '/res/v1/models') return proto === 'responses';
             if (pathname === '/mes/v1/models') return proto === 'messages';

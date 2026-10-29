@@ -1,6 +1,6 @@
 'use strict';
 
-const UPSTREAM = 'https://opencode.ai/zen/v1';
+const UPSTREAM = 'https://opencode.ai/inference/v1';
 const PROXY_API_KEY = ''; // set via wrangler secret PROXY_API_KEY if needed
 
 const KNOWN_FREE_EXTRA = new Set(['big-pickle', 'grok-code']);
@@ -33,9 +33,11 @@ function synthesizeOpencodeId(prefix) {
   return opencodeIdFromDigest(prefix, crypto.getRandomValues(new Uint8Array(32)));
 }
 // 2026-10-24 (9router PR #4791): zen은 ses_의 hex 12자가 inverted timestamp인지 검사.
+// 9router #5218: counter는 1..16 범위에서 순환해야 통과(100 이상은 403).
 let zenIdCounter = 0;
 function canonicalSessionId() {
-  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter++ % 4096);
+  zenIdCounter = (zenIdCounter % 16) + 1;
+  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter);
   const inverted = ~units & ((1n << 48n) - 1n);
   const hexPart = inverted.toString(16).padStart(12, '0');
   const digest = crypto.getRandomValues(new Uint8Array(14));
@@ -74,21 +76,20 @@ function extractLastUserText(body) {
   }
   return '';
 }
-const ZEN_UA = 'opencode/1.18.31';
+// 9router #5218: OpenCode v2 CLI UA & headers
+const ZEN_UA = 'opencode/latest/2.2.0/cli';
 // async가 됐다 — 호출부에서 await 필요.
 async function injectHeaders(headers, upstreamBody) {
   const h = { ...headers };
   const sessionId = await zenSessionId();
   h['User-Agent'] = ZEN_UA;
+  h['x-opencode-session-id'] = sessionId;
   h['x-opencode-session'] = sessionId;
-  if (upstreamBody === undefined) {
-    h['x-opencode-request'] = synthesizeOpencodeId('msg_');
-  } else {
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sessionId + '|' + extractLastUserText(upstreamBody))));
-    h['x-opencode-request'] = opencodeIdFromDigest('msg_', digest);
-  }
-  h['x-opencode-client'] = 'desktop';
-  h['x-opencode-project'] = 'global';
+  h['x-session-affinity'] = sessionId;
+  h['x-session-id'] = sessionId;
+  h['x-opencode-client'] = 'cli';
+  h['x-opencode-project'] = crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().replace(/-/g,'').slice(0,8);
+  delete h['x-opencode-request'];
   return h;
 }
 function authOk(request, env) {

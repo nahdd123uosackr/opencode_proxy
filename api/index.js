@@ -1,6 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
-const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/zen/v1';
+const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/inference/v1';
 
 // === Key Circuit Breaker & Cooldown Manager ===
 const keyStatusMap = new Map(); // keyHash -> { cooldownUntil: number, fails: number, reason: string }
@@ -80,6 +80,9 @@ function checkAndMarkResponse(key, status, bodyText) {
 
   if (isError) {
     markKeyFailure(key, errStatus, bodyText);
+    if (errStatus === 429 || /FreeUsageLimitError/i.test(bodyText || '')) {
+      resetZenSession(key);
+    }
   } else {
     markKeySuccess(key);
   }
@@ -296,9 +299,12 @@ function synthesizeOpencodeId(prefix) {
 // 그래서 세션 id는 canonical 방식(반전 타임스탬프 hex + base62 꼬리)으로 발급하고,
 // 일 단위 고정/키 단위 고정은 "발급된 canonical id를 캐시"하는 방식으로 유지한다.
 const ZEN_TS_MASK = (1n << 48n) - 1n;
+const SESSION_COUNTER_MAX = 16;
 let zenIdCounter = 0;
 function canonicalSessionId() {
-  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter++ % 4096);
+  // 9router #5218: counter must wrap in 1..16 (values >=100 give 403 FreeTierError)
+  zenIdCounter = (zenIdCounter % SESSION_COUNTER_MAX) + 1;
+  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter);
   const inverted = (~units) & ZEN_TS_MASK;
   const hexPart = inverted.toString(16).padStart(12, '0');
   const digest = crypto.randomBytes(14);
@@ -309,6 +315,14 @@ function canonicalSessionId() {
 const ZEN_SESSION_MODE = process.env.ZEN_SESSION_MODE || 'stable'; // 'stable' | 'random'
 let zenAnonSession = null; // { id: string, day: string }
 const zenKeySessionCache = new Map(); // keyHash -> canonical session id (프로세스 수명 동안 고정)
+function resetZenSession(zenApiKey) {
+  if (zenApiKey) {
+    const keyHash = crypto.createHash('sha256').update(String(zenApiKey)).digest('hex').slice(0, 16);
+    zenKeySessionCache.delete(keyHash);
+  } else {
+    zenAnonSession = null;
+  }
+}
 function sessionIdFor(zenApiKey) {
   if (ZEN_SESSION_MODE === 'random') return canonicalSessionId();
   const day = new Date().toISOString().slice(0, 10); // UTC 일 단위
@@ -353,43 +367,169 @@ function extractLastUserText(body) {
   }
   return '';
 }
-// 실측 정규식(청크 20420.js): /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/i — major>1 이거나
-// (major===1 && minor>=17)이어야 통과. 예전 'opencode/latest/2.0.5/cli'는 'latest'가
-// 숫자가 아니라서 이 매칭 자체가 실패해 게이트를 통과 못 했었다(P33 재발 원인).
-const ZEN_UA = 'opencode/1.18.31';
+// 실측 정규식(청크 20420.js): /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/i
+// 9router #5218: 2026-10-14 이후 v1 UA('opencode/1.18.x')는 403 FreeTierError로 차단됨.
+// v2 CLI UA 형식('opencode/latest/2.0.26/cli')을 사용하여 통과.
+const ZEN_UA = process.env.ZEN_UA || 'opencode/latest/2.2.0/cli';
+function randomProjectID() {
+  return crypto.randomBytes(20).toString('hex'); // 40-char git commit sha 형태 (global 대신 독립 버킷)
+}
+
 function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   const h = { ...headers };
   const sessionId = sessionIdFor(zenApiKey);
   h['User-Agent'] = ZEN_UA;
+  h['x-opencode-session-id'] = sessionId;
   h['x-opencode-session'] = sessionId;
-  h['x-opencode-request'] = requestIdFor(sessionId, upstreamBody);
-  h['x-opencode-client'] = 'desktop';
-  h['x-opencode-project'] = 'global';
+  h['x-session-affinity'] = sessionId; // 정품 CLI 2.x 4종 헤더 동시 전송
+  h['x-session-id'] = sessionId;
+  h['x-opencode-client'] = 'cli';
+  h['x-opencode-project'] = randomProjectID(); // global pre-burned 버킷 회피
+  // v2에서 삭제된 지문 제거
+  delete h['x-opencode-request'];
   if (zenApiKey) {
     h['Authorization'] = zenApiKey.startsWith('Bearer ') ? zenApiKey : `Bearer ${zenApiKey}`;
+  } else {
+    h['Authorization'] = 'Bearer public';
   }
   return h;
 }
 
-// P33: zen free tier 게이트는 (a) 위 세션/UA 헤더 계약과 별개로 (b) body에 stream:true +
-// 비어있지 않은 tools 배열을 요구한다(모델별로 정확히 어떤 tool 이름이 통과하는지는
-// 예측 불가 — 실측: _noop 하나만으론 muse-spark/big-pickle 등 다수 모델에서 403
-// FreeTierError 유지, 실제 opencode CLI 도구 이름(bash/read/write/edit/glob/grep/
-// webfetch/websearch/task/todowrite) 여러 개를 한꺼번에 넣으면 통과). OmniRoute
-// PR #14013의 "observation-reuse"(성공한 이름을 캐시해 재사용) 전략을 간소화해서,
-// 매번 이 고정된 실측 검증 도구 이름 세트를 채워 넣는 것으로 대체한다 — 동적 관찰
-// 캐시까지는 필요 없고, 이 세트 자체가 이미 muse-spark 포함 여러 모델에서 통과 확인됨.
-const ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES = ['bash', 'read', 'write', 'edit', 'glob', 'grep', 'webfetch', 'websearch', 'task', 'todowrite'];
+// 9router #5218 / #5253: OpenCode Zen Free tier 게이트웨이 요구사항:
+// 1) 시스템 프롬프트에 <env> 블록(Working directory 및 Workspace root folder)이 없으면 즉시 429 FreeUsageLimitError 반환
+// 2) 도구 목록에 read와 shell의 정확한 스키마 및 설명이 포함되어야 함
+const OPENCODE_ENV_MARKER =
+  "<env>\n  Working directory: /workspace\n  Workspace root folder: /workspace\n  Platform: linux\n  Date: " + new Date().toISOString().replace(/\.\d{3}Z$/, 'Z') + "\n</env>";
+const ENV_BLOCK_RE = /<env>([\s\S]*?)<\/env>/;
+const ENV_MARKER_RE = /<env>[\s\S]*?Working directory:[\s\S]*?Workspace root folder:[\s\S]*?<\/env>/;
+const ENV_WORKDIR_RE = /Working directory:[^\n]*/;
+const ENV_ROOT_RE = /Workspace root folder:/;
+
+function hasEnvMarker(value) {
+  return typeof value === 'string' && ENV_MARKER_RE.test(value);
+}
+
+function upgradeEnvBlock(text) {
+  return text.replace(ENV_BLOCK_RE, (block, inner) => {
+    if (ENV_ROOT_RE.test(inner)) return block;
+    const root = '  Workspace root folder: /workspace';
+    const upgraded = ENV_WORKDIR_RE.test(inner)
+      ? inner.replace(ENV_WORKDIR_RE, (line) => `${line}\n${root}`)
+      : `${inner.replace(/\s*$/, '')}\n${root}\n`;
+    return `<env>${upgraded}</env>`;
+  });
+}
+
+function withEnvMarker(value) {
+  const text = typeof value === 'string' ? value : '';
+  if (hasEnvMarker(text)) return text;
+  if (ENV_BLOCK_RE.test(text)) return upgradeEnvBlock(text);
+  return text.trim() ? `${text}\n\n${OPENCODE_ENV_MARKER}` : OPENCODE_ENV_MARKER;
+}
+
+function applyFingerprintSystemPrompt(body) {
+  if (!body || typeof body !== 'object') return body;
+
+  if (body.system !== undefined) {
+    if (typeof body.system === 'string') {
+      body.system = withEnvMarker(body.system);
+    } else if (Array.isArray(body.system)) {
+      const marked = body.system.some((block) =>
+        hasEnvMarker(typeof block === 'string' ? block : block?.text)
+      );
+      if (!marked) body.system = [...body.system, { type: 'text', text: OPENCODE_ENV_MARKER }];
+    }
+    return body;
+  }
+
+  if (body.instructions !== undefined) {
+    if (typeof body.instructions === 'string') body.instructions = withEnvMarker(body.instructions);
+    return body;
+  }
+
+  if (Array.isArray(body.input) && !Array.isArray(body.messages)) {
+    body.instructions = OPENCODE_ENV_MARKER;
+    return body;
+  }
+
+  if (!Array.isArray(body.messages)) return body;
+
+  const first = body.messages[0];
+  if (first && first.role === 'system') {
+    if (typeof first.content === 'string') {
+      body.messages = [{ ...first, content: withEnvMarker(first.content) }, ...body.messages.slice(1)];
+      return body;
+    }
+    if (Array.isArray(first.content)) {
+      const marked = first.content.some((part) => hasEnvMarker(part?.text));
+      if (!marked) {
+        body.messages = [
+          { ...first, content: [...first.content, { type: 'text', text: OPENCODE_ENV_MARKER }] },
+          ...body.messages.slice(1),
+        ];
+      }
+      return body;
+    }
+  }
+
+  body.messages = [{ role: 'system', content: OPENCODE_ENV_MARKER }, ...body.messages];
+  return body;
+}
+
+// 9router: OpenCode 공식 CLI(v2.0.26)의 read와 shell 정확한 도구 정의
+const FINGERPRINT_TOOL_DEFINITIONS = {
+  read: {
+    description: 'Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'File or directory to read' },
+        offset: { type: 'integer', minimum: 0, description: 'The line or directory entry to start reading from (1-based)' },
+        limit: { type: 'integer', minimum: 0, description: 'The maximum number of lines or directory entries to read (defaults to and capped at 2000)' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  shell: {
+    description: 'Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Shell command string to execute' },
+        workdir: { type: 'string', description: 'Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.' },
+        timeout: { type: 'integer', minimum: 0, description: 'Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.' },
+        background: { type: 'boolean', description: 'Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use \'&\' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+};
+
+const ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES = ['read', 'shell', 'bash', 'write', 'edit', 'glob', 'grep', 'webfetch', 'websearch', 'task', 'todowrite'];
 function zenPlaceholderToolsFor(requestFormat) {
   if (requestFormat === 'responses') {
-    return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => ({
-      type: 'function', name, description: 'Do not call this tool. It exists only to satisfy a client contract requirement.', parameters: { type: 'object', properties: {} },
-    }));
+    return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => {
+      const def = FINGERPRINT_TOOL_DEFINITIONS[name];
+      if (def) {
+        return { type: 'function', name, description: def.description, parameters: def.parameters };
+      }
+      return {
+        type: 'function', name, description: 'Do not call this tool. It exists only to satisfy a client contract requirement.', parameters: { type: 'object', properties: {} },
+      };
+    });
   }
-  return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => ({
-    type: 'function',
-    function: { name, description: 'Do not call this tool. It exists only to satisfy a client contract requirement.', parameters: { type: 'object', properties: {} } },
-  }));
+  return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => {
+    const def = FINGERPRINT_TOOL_DEFINITIONS[name];
+    if (def) {
+      return { type: 'function', function: { name, description: def.description, parameters: def.parameters } };
+    }
+    return {
+      type: 'function',
+      function: { name, description: 'Do not call this tool. It exists only to satisfy a client contract requirement.', parameters: { type: 'object', properties: {} } },
+    };
+  });
 }
 // muse-spark는 /chat/completions에서 tools 계약을 갖춰도 500 Internal server error로
 // 실패한다(실측 확인, 계약과 무관한 그 엔드포인트 자체의 결함) — /responses에서는
@@ -419,7 +559,7 @@ async function isZenFreeTierModel(modelId) {
 const ZEN_MIN_TOOLS = 6;
 function applyZenFreeTierContract(body, requestFormat) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
-  const next = { ...body, stream: true };
+  let next = applyFingerprintSystemPrompt({ ...body, stream: true });
   let existing = Array.isArray(next.tools) ? next.tools : [];
   // P36 fix: CLIProxyAPI의 codex 실행기 등이 자동 주입하는 type:"image_generation"
   // 같은 비호환 도구는 zen이 타입 자체를 미지원해 403/400으로 거부한다(P24 교훈).
@@ -1241,6 +1381,9 @@ async function museViaResponses(upstreamModel, bodyObj, variant, isStream, zenAp
     stream: isFreeTier ? true : !!isStream,
     metadata: { _nonce: crypto.randomUUID().slice(0, 12) },
   };
+  if (isFreeTier) {
+    applyFingerprintSystemPrompt(rbody);
+  }
   const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': rbody.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, rbody);
   return fetch(UPSTREAM + '/responses', { method: 'POST', headers: headers, body: JSON.stringify(rbody) });
 }
@@ -1773,6 +1916,9 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       ...(anthToolChoice ? { tool_choice: anthToolChoice } : {})
     };
     openReq = applyVariant(applyMuseDefaults(openReq, 'chat'), effectiveVariant);
+    if (await isZenFreeTierModel(upstreamModel)) {
+      openReq = applyZenFreeTierContract(openReq, 'chat');
+    }
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, openReq);
 
     try {

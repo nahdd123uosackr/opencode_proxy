@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenCode v2 genuine server (127.0.0.1:49380), egress through the relay bridge
+After=network-online.target opencode-relay-bridge.service
+Requires=opencode-relay-bridge.service
+
+[Service]
+User=ocv2
+Group=ocv2
+WorkingDirectory=/var/lib/opencode-v2/work
+EnvironmentFile=/etc/opencode-v2.env
+Environment=XDG_DATA_HOME=/var/lib/opencode-v2/data
+Environment=XDG_CONFIG_HOME=/var/lib/opencode-v2/config
+Environment=XDG_STATE_HOME=/var/lib/opencode-v2/state
+Environment=XDG_CACHE_HOME=/var/lib/opencode-v2/cache
+Environment=HOME=/var/lib/opencode-v2
+Environment=HTTPS_PROXY=http://127.0.0.1:18790
+ExecStart=/opt/opencode-v2/bin/opencode serve --hostname 127.0.0.1 --port 49380
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opencode-v2
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

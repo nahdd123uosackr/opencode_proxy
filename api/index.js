@@ -507,7 +507,7 @@ const FINGERPRINT_TOOL_DEFINITIONS = {
   },
 };
 
-const ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES = ['read', 'shell', 'bash', 'write', 'edit', 'glob', 'grep', 'webfetch', 'websearch', 'task', 'todowrite'];
+const ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES = ['read', 'shell'];
 function zenPlaceholderToolsFor(requestFormat) {
   if (requestFormat === 'responses') {
     return ZEN_FREE_TIER_PLACEHOLDER_TOOL_NAMES.map((name) => {
@@ -1516,7 +1516,9 @@ const handle = async (req, res) => {
   // (예: OmniRoute의 opencode-key-chat 프로바이더)를 받아준다. 접두사만 벗겨서
   // 기존 /v1/* 처리 경로를 그대로 재사용한다 — zen 전용 동작(무료 티어 계약,
   // 프로토콜 분기, 모델 판별)을 중복 구현하지 않기 위해서다.
+  let isOpencodePrefix = false;
   if (pathname === '/opencode' || pathname.startsWith('/opencode/')) {
+    isOpencodePrefix = true;
     pathname = pathname.slice('/opencode'.length) || '/';
     if (!pathname.startsWith('/')) pathname = '/' + pathname;
   }
@@ -1565,6 +1567,26 @@ const handle = async (req, res) => {
   // ============================================================
   if (req.method === 'GET' && pathname === '/v1/models') {
     try {
+      if (isOpencodePrefix) {
+        const zenModels = await getFreeModelsExpanded();
+        const nowSec = Math.floor(Date.now() / 1000);
+        const data = [];
+        const seen = new Set();
+        for (const m of zenModels) {
+          const rawId = m.id.replace(/^opencode\//, '');
+          if (!seen.has(rawId)) {
+            seen.add(rawId);
+            data.push({ id: rawId, object: 'model', created: nowSec, owned_by: 'opencode' });
+          }
+          if (!seen.has(m.id)) {
+            seen.add(m.id);
+            data.push({ id: m.id, object: 'model', created: nowSec, owned_by: 'opencode' });
+          }
+        }
+        data.sort((a, b) => a.id.localeCompare(b.id));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify({ object: 'list', data }));
+      }
       let data = [];
       if (isKilo) {
         // 1. Kilo Key: Kilo 관련 무료 모델만 반환 (upstream은 key 없이 조회)

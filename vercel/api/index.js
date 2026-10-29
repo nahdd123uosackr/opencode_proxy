@@ -370,7 +370,7 @@ function extractLastUserText(body) {
 // 실측 정규식(청크 20420.js): /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/i
 // 9router #5218: 2026-10-14 이후 v1 UA('opencode/1.18.x')는 403 FreeTierError로 차단됨.
 // v2 CLI UA 형식('opencode/latest/2.0.26/cli')을 사용하여 통과.
-const ZEN_UA = 'opencode/latest/2.0.26/cli';
+const ZEN_UA = process.env.ZEN_UA || 'opencode/latest/2.2.0/cli';
 function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   const h = { ...headers };
   const sessionId = sessionIdFor(zenApiKey);
@@ -394,7 +394,7 @@ function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
 // 1) 시스템 프롬프트에 <env> 블록(Working directory 및 Workspace root folder)이 없으면 즉시 429 FreeUsageLimitError 반환
 // 2) 도구 목록에 read와 shell의 정확한 스키마 및 설명이 포함되어야 함
 const OPENCODE_ENV_MARKER =
-  "<env>\n  Working directory: /workspace\n  Workspace root folder: /workspace\n</env>";
+  "<env>\n  Working directory: /workspace\n  Workspace root folder: /workspace\n  Platform: linux\n  Date: " + new Date().toISOString().replace(/\.\d{3}Z$/, 'Z') + "\n</env>";
 const ENV_BLOCK_RE = /<env>([\s\S]*?)<\/env>/;
 const ENV_MARKER_RE = /<env>[\s\S]*?Working directory:[\s\S]*?Workspace root folder:[\s\S]*?<\/env>/;
 const ENV_WORKDIR_RE = /Working directory:[^\n]*/;

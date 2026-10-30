@@ -125,7 +125,7 @@ async function getKiloFreeModels() {
 // 2026-09-30: hermes.ai.unturf.com이 죽어서(502, 실측 확인 — pool 경유 /uncloseai/ 요청이
 // "all upstreams exhausted"로 45개 노드 전부 실패) qwen.ai.unturf.com으로 교체. 모델 목록
 // 재확인 결과 turboderp/Qwen3.8-27B-exl3 그대로 서빙 중이라 config.yaml 쪽 모델명은 안 바꿔도 됨.
-const BLOCKRUN_BASE = 'https://blockrun.ai/api/v1';
+const BLOCKRUN_BASE = 'https://blockrun.ai/api';
 let blockrunModelsCache = null, blockrunModelsCacheTime = 0;
 
 async function getBlockrunModels() {

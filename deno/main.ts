@@ -441,7 +441,7 @@ async function getKiloFreeModels() {
 // === UncloseAI 프로바이더 (완전 무인증, OmniRoute registry authType:"optional"로 확인) ===
 // 클라이언트가 어떤 키를 보내든(zen/kilo/없음) 무관하게 항상 사용 가능 — 업스트림이 키 자체를
 // 요구하지 않는다(2026-09-12 실측: 키 없이 /v1/models·/v1/chat/completions 둘 다 200).
-const BLOCKRUN_BASE = 'https://blockrun.ai/api/v1';
+const BLOCKRUN_BASE = 'https://blockrun.ai/api';
 let blockrunModelsCache = null;
 let blockrunModelsCacheTime = 0;
 async function getBlockrunModels() {

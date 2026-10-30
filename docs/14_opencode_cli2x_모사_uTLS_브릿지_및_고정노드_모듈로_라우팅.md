@@ -70,6 +70,9 @@ OpenCode Zen 백엔드는 비정상적인 클라이언트 호출 시 400이나 4
 - OpenCode 요청에서 상위 429(`FreeUsageLimitError`) 수신 시, 12개 후보 노드를 15초간 헛돌며 순환(failover)하지 않고 **0.38초 만에 즉시 429를 클라이언트로 반환**하도록 최적화. 상위 라우터(OmniRoute, New-API)가 즉시 다음 프로바이더로 전환 가능.
 
 ### 3.6 고정 IP 노드 1:1 매핑 및 N%3 모듈로 라우팅 (`pool.js`)
+- **OpenCode 모델 한정 라우팅**:
+  - `isOpenCodeCliModel(model, url)`을 통해 `opencode/*` 및 Zen 계열 모델만 고정 노드 매핑을 거치도록 격리.
+  - **Kilo, Blockrun, Dahl 등 타 프로바이더 모델은 키 번호와 관계없이 전체 44개 노드(Vercel, Deno 등)로 정상 분산(Load Balancing)**됨.
 - 고정 IP / 전용 uTLS 노드 목록을 `FIXED_NODES` 배열로 분리:
   ```javascript
   const FIXED_NODES = [

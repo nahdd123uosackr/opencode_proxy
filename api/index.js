@@ -132,7 +132,7 @@ async function getBlockrunModels() {
   const now = Date.now();
   if (blockrunModelsCache && (now - blockrunModelsCacheTime) < 300000) return blockrunModelsCache;
   try {
-    const r = await fetch(BLOCKRUN_BASE + '/models', { signal: AbortSignal.timeout(15000) });
+    const r = await fetch(BLOCKRUN_BASE + '/v1/models', { signal: AbortSignal.timeout(15000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     const nowSec = Math.floor(now / 1000);
@@ -2392,7 +2392,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     const isStream = !!body.stream;
     const uHeaders = { 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' };
     try {
-      const ur = await fetch(BLOCKRUN_BASE + '/chat/completions', {
+      const ur = await fetch(BLOCKRUN_BASE + '/v1/chat/completions', {
         method: 'POST', headers: uHeaders, body: JSON.stringify({ ...body, model: realModel }),
         signal: AbortSignal.timeout(parseInt(process.env.BLOCKRUN_TIMEOUT_MS || '120000', 10)),
       });

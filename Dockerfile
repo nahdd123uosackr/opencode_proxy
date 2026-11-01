@@ -4,14 +4,14 @@ WORKDIR /build
 COPY utls_bridge/ ./
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o utls_bridge .
 
-# Stage 2: Node.js runtime
-FROM node:20-alpine
+# Stage 2: Bun runtime
+FROM oven/bun:1-alpine
 WORKDIR /app
 COPY package.json ./
-RUN npm install --omit=dev --ignore-scripts --no-audit --no-fund
+RUN bun install --production --ignore-scripts
 COPY api/ ./api/
 COPY server.js relay.js ./
 COPY --from=builder /build/utls_bridge ./utls_bridge/utls_bridge
 EXPOSE 8080
 ENV PORT=8080
-CMD ["node", "server.js"]
+CMD ["bun", "server.js"]

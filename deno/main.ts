@@ -1333,10 +1333,14 @@ export default {
       const realModel = String(pbody.model).replace(/^dahl\//i, '');
       const isStream = !!pbody.stream;
       const dHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
+      const inboundAuth = request.headers.get('authorization') || request.headers.get('x-api-key') || '';
+      const rawInboundKey = inboundAuth.replace(/^Bearer\s+/i, '').trim();
+      const explicitDahlKey = rawInboundKey.startsWith('dahl_') ? rawInboundKey : null;
+
       try {
         let dr;
         for (let attempt = 0; attempt < 2; attempt++) {
-          dHeaders.Authorization = `Bearer ${await getDahlToken(attempt > 0)}`;
+          dHeaders.Authorization = `Bearer ${explicitDahlKey || await getDahlToken(attempt > 0)}`;
           dr = await fetch(DAHL_BASE + '/v1/chat/completions', { method: 'POST', headers: dHeaders, body: JSON.stringify({ ...pbody, model: realModel }) });
           if ((dr.status === 401 || dr.status === 403) && attempt === 0) continue;
           break;

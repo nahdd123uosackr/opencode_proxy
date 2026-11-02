@@ -1,4 +1,22 @@
 'use strict';
+// Load environment variables from /etc/opencode-proxy.env or .env
+try {
+  const fs = require('fs');
+  const path = require('path');
+  const envPaths = ['/etc/opencode-proxy.env', path.join(__dirname, '.env')];
+  for (const ep of envPaths) {
+    if (fs.existsSync(ep)) {
+      const lines = fs.readFileSync(ep, 'utf8').split('\n');
+      for (const line of lines) {
+        const m = line.match(/^\s*([A-Za-z_0-9]+)\s*=\s*(.*)?$/);
+        if (m && !process.env[m[1]]) {
+          process.env[m[1]] = (m[2] || '').trim().replace(/^['"]|['"]$/g, '');
+        }
+      }
+    }
+  }
+} catch (_) {}
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');

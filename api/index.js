@@ -1655,8 +1655,12 @@ const handle = async (req, res) => {
       const uHeaders = { 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' };
       try {
         let fr;
+        const clientAuth = req.headers['authorization'] || req.headers['x-api-key'] || '';
+        const explicitKey = clientAuth.replace(/^Bearer\s+/i, '').trim();
+        const useExplicit = explicitKey.startsWith('dahl_') ? explicitKey : null;
+
         for (let attempt = 0; attempt < (isDahl ? 2 : 1); attempt++) {
-          if (isDahl) uHeaders['Authorization'] = `Bearer ${await getDahlToken(attempt > 0)}`;
+          if (isDahl) uHeaders['Authorization'] = `Bearer ${useExplicit || await getDahlToken(attempt > 0)}`;
           fr = await fetch(upstreamBase + '/v1/chat/completions', {
             method: 'POST',
             headers: uHeaders,
@@ -2471,10 +2475,14 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     const realModel = String(body.model).replace(/^dahl\//i, '');
     const isStream = !!body.stream;
     const dHeaders = { 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' };
+    const inboundAuth = req.headers['authorization'] || req.headers['x-api-key'] || '';
+    const rawInboundKey = inboundAuth.replace(/^Bearer\s+/i, '').trim();
+    const explicitDahlKey = rawInboundKey.startsWith('dahl_') ? rawInboundKey : null;
+
     try {
       let dr;
       for (let attempt = 0; attempt < 2; attempt++) {
-        dHeaders['Authorization'] = `Bearer ${await getDahlToken(attempt > 0)}`;
+        dHeaders['Authorization'] = `Bearer ${explicitDahlKey || await getDahlToken(attempt > 0)}`;
         dr = await fetch(DAHL_BASE + '/v1/chat/completions', {
           method: 'POST', headers: dHeaders, body: JSON.stringify({ ...body, model: realModel }),
           signal: AbortSignal.timeout(parseInt(process.env.UNCLOSEAI_DAHL_TIMEOUT_MS || '120000', 10)),

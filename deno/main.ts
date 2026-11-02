@@ -1443,8 +1443,12 @@ export default {
         const upstreamBase = isBlockrun ? BLOCKRUN_BASE : (isDahl ? DAHL_BASE : UNCLOSEAI_BASE);
         const uHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
         let ur;
+        const clientAuth = request.headers.get('authorization') || '';
+        const explicitKey = clientAuth.replace(/^Bearer\s+/i, '').trim();
+        const useExplicit = explicitKey.startsWith('dahl_') ? explicitKey : null;
+
         for (let attempt = 0; attempt < (isDahl ? 2 : 1); attempt++) {
-          if (isDahl) uHeaders.Authorization = `Bearer ${await getDahlToken(attempt > 0)}`;
+          if (isDahl) uHeaders.Authorization = `Bearer ${useExplicit || await getDahlToken(attempt > 0)}`;
           ur = await fetch(upstreamBase + '/v1/chat/completions', { method: 'POST', headers: uHeaders, body: JSON.stringify({ ...body, model: realModel }) });
           // dahl 토큰이 (관찰된 적은 없지만) 무효화됐을 가능성에 대비: 인증 실패면 재발급 1회 재시도
           if (isDahl && (ur.status === 401 || ur.status === 403) && attempt === 0) continue;

@@ -191,6 +191,10 @@ async function mintDahlToken() {
 }
 
 async function getDahlToken(forceNew) {
+  // 환경변수에 명시적 DAHL_API_KEY가 있으면 최우선 사용
+  if (process.env.DAHL_API_KEY) {
+    return process.env.DAHL_API_KEY.trim();
+  }
   const now = Date.now();
   if (!forceNew && dahlTokenCache && (now - dahlTokenCacheTime) < DAHL_TOKEN_TTL) return dahlTokenCache;
   const token = await mintDahlToken();

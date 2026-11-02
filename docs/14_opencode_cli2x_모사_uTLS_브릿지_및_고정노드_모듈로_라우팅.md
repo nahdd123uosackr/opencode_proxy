@@ -114,3 +114,25 @@ OpenCode Zen 백엔드는 비정상적인 클라이언트 호출 시 400이나 4
 - **Blockrun** (`north-mini-code`): 43/44개 노드 200 OK (성공률 98%)
 - **Kilo** (`kilo-auto/free`): 33/44개 노드 200 OK (성공률 75%)
 - **OpenCode** (`big-pickle`): 고정 uTLS 노드(oracle1, oracle2, northflank) 200 OK 정상 동작
+
+
+---
+
+## 5. Dahl 프로바이더 Turnstile 우회 및 노드별 키 1:1 매핑/자동 재발급
+
+### 5.1 배경 및 문제
+- 2026-10-31 이후 Dahl(inference.dahl.global) 상위 게이트웨이가 토큰 발급 API(`POST /tokens`)에 Cloudflare Turnstile(SiteKey: `0x4AAAAAAFo5t2cRvAgWO-5T`, Action: `guest_key`)을 강제 적용함.
+- 헤더/UA 모사만으로는 `403 browser_check_failed`를 반환하여 자동 발급이 전면 차단됨.
+
+### 5.2 해결 및 구현 (`opencode-pool`)
+1. **flip4 `browseros-neo` (MCP 브라우저) 기반 Turnstile 챌린지 및 키 발급기**:
+   - `/opt/opencode-pool/mint_dahl_key.py`: flip4의 Chromium 런타임에서 Turnstile 위젯을 렌더링하고, 1초 간격 응답 폴링 후 서명된 `turnstile_token`으로 `POST /tokens` 호출.
+   - 1억 토큰(`100,000,000`) 한도의 정품 Dahl 키 자동 발급.
+2. **노드별 1:1 키 매칭 (`/opt/opencode-pool/dahl-keys.json`)**:
+   - 풀에 등록된 44개 노드마다 고유한 Dahl API 키를 매핑(`node -> key`).
+   - 최초 1회 발급 후 영구 저장 관리.
+3. **만료/소진 시 즉시 자동 재발급 트리거**:
+   - Dahl 요청 중 401(만료), 403(키 무효), 또는 토큰 에러 수신 시:
+   - `invalidateAndRemintDahlKey(nodeNum)`가 실행되어 해당 노드의 키를 즉시 무효화하고 `browseros-neo`를 통해 백그라운드 재발급 후 파일 갱신.
+4. **업스트림 투명 전달**:
+   - `pool.js`가 노드 호출 시 `Authorization: Bearer <node-specific-dahl-key>`를 주입하고, 각 노드(`api/index.js`, `deno/main.ts`)는 이 인바운드 키를 그대로 채택하여 상위 서버로 전송.

@@ -12,6 +12,6 @@ RUN bun install --production --ignore-scripts
 COPY api/ ./api/
 COPY server.js relay.js ./
 COPY --from=builder /build/utls_bridge ./utls_bridge/utls_bridge
-EXPOSE 8080
-ENV PORT=8080
+EXPOSE 3000
+ENV PORT=3000 HOST=0.0.0.0
 CMD ["bun", "server.js"]

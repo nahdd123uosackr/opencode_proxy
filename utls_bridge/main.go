@@ -22,8 +22,7 @@ var (
 func newBunTransport() *http.Transport {
 	return &http.Transport{
 		Proxy:                 nil, // direct
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		DisableKeepAlives:     true, // PR #5381 / #5411: clean socket teardown, prevents 429 pooling poisoning
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -101,6 +100,7 @@ func main() {
 			}
 		}
 		outReq.Header.Set("Host", targetHost)
+		outReq.Close = true // Force connection close after response to avoid poisoned socket reuse
 
 		resp, err := client.Do(outReq)
 		if err != nil {
@@ -108,7 +108,12 @@ func main() {
 			http.Error(w, fmt.Sprintf("upstream uTLS error: %v", err), http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusTooManyRequests {
+				transport.CloseIdleConnections()
+			}
+		}()
 
 		// Copy response headers
 		for k, vv := range resp.Header {

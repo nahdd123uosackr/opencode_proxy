@@ -367,10 +367,17 @@ function extractLastUserText(body) {
   }
   return '';
 }
-// 실측 정규식(청크 20420.js): /opencode\/(?:[a-z]+\/)?v?(\d+)\.(\d+)/i
-// 9router #5218: 2026-10-14 이후 v1 UA('opencode/1.18.x')는 403 FreeTierError로 차단됨.
-// v2 CLI UA 형식('opencode/latest/2.0.26/cli')을 사용하여 통과.
-const ZEN_UA = process.env.ZEN_UA || 'opencode/latest/2.2.0/cli';
+// 9router #5381 / #5411 / #5482 (2026-11): OpenCode Zen v2 wire signature parity
+// 1) v2 CLI dev 서명 UA ('opencode/dev/0.0.0-dev-202610272228/opencode')
+// 2) x-opencode-client: 'opencode' (구버전 'cli' 탈피)
+// 3) x-opencode-request: 요청별 고유 req_<24hex> 생성 (삭제 방지)
+// 4) Connection: close로 소켓/세션 풀링 오염(429 체이닝) 방지
+// 5) prompt_cache_key 세션 바인딩
+const ZEN_UA = process.env.ZEN_UA || 'opencode/dev/0.0.0-dev-202610272228/opencode';
+function randomProjectID() {
+  return crypto.randomBytes(20).toString('hex'); // 40-char git commit sha 형태 (global 대신 독립 버킷)
+}
+
 function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   const h = { ...headers };
   const sessionId = sessionIdFor(zenApiKey);
@@ -378,10 +385,14 @@ function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   h['x-opencode-session-id'] = sessionId;
   h['x-opencode-session'] = sessionId;
   h['x-session-affinity'] = sessionId;
-  h['x-session-id'] = sessionId;
-  h['x-opencode-client'] = 'cli';
-  h['x-opencode-project'] = crypto.randomBytes(20).toString('hex');
-  delete h['x-opencode-request'];
+  h['X-Session-Id'] = sessionId;
+  h['x-opencode-client'] = 'opencode';
+  h['x-opencode-project'] = randomProjectID();
+  h['x-opencode-request'] = 'req_' + crypto.randomBytes(12).toString('hex');
+  h['Connection'] = 'close';
+  if (upstreamBody && typeof upstreamBody === 'object' && !upstreamBody.prompt_cache_key) {
+    upstreamBody.prompt_cache_key = sessionId;
+  }
   if (zenApiKey) {
     h['Authorization'] = zenApiKey.startsWith('Bearer ') ? zenApiKey : `Bearer ${zenApiKey}`;
   } else {

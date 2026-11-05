@@ -1,5 +1,8 @@
 {
   "name": "opencode-proxy-vercel",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }

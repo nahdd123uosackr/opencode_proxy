@@ -177,19 +177,24 @@ function extractLastUserText(body: any): string {
   }
   return '';
 }
-const ZEN_UA = 'opencode/latest/2.2.0/cli';
+// 9router #5381 / #5411 / #5482 (2026-11): OpenCode Zen v2 wire signature parity
+const ZEN_UA = Deno.env.get('ZEN_UA') || 'opencode/dev/0.0.0-dev-202610272228/opencode';
 // injectHeaders가 async가 됐다 — 호출부는 모두 await 해야 한다.
-async function injectHeaders(headers: any, upstreamBody?: unknown) {
+async function injectHeaders(headers: any, upstreamBody?: any) {
   const h = { ...headers };
   const sessionId = await sessionIdFor();
   h['User-Agent'] = ZEN_UA;
   h['x-opencode-session-id'] = sessionId;
   h['x-opencode-session'] = sessionId;
   h['x-session-affinity'] = sessionId;
-  h['x-session-id'] = sessionId;
-  h['x-opencode-client'] = 'cli';
-  h['x-opencode-project'] = crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().replace(/-/g,'').slice(0,8); // 40-char git sha 형태
-  delete h['x-opencode-request'];
+  h['X-Session-Id'] = sessionId;
+  h['x-opencode-client'] = 'opencode';
+  h['x-opencode-project'] = crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().replace(/-/g,'').slice(0,8);
+  h['x-opencode-request'] = 'req_' + crypto.randomUUID().replace(/-/g,'').slice(0,24);
+  h['Connection'] = 'close';
+  if (upstreamBody && typeof upstreamBody === 'object' && !upstreamBody.prompt_cache_key) {
+    upstreamBody.prompt_cache_key = sessionId;
+  }
   return h;
 }
 

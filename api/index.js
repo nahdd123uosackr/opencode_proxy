@@ -2,6 +2,11 @@
 const crypto = require('node:crypto');
 const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/inference/v1';
 
+let opencodeCanonical = null;
+try {
+  opencodeCanonical = require('./opencodeCanonical.js');
+} catch (_) {}
+
 // === Key Circuit Breaker & Cooldown Manager ===
 const keyStatusMap = new Map(); // keyHash -> { cooldownUntil: number, fails: number, reason: string }
 
@@ -569,17 +574,36 @@ async function isZenFreeTierModel(modelId) {
 const ZEN_MIN_TOOLS = 6;
 function applyZenFreeTierContract(body, requestFormat) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+
+  // OmniRoute PR #19128 (2026-11): Canonical OpenCode CLI prompt & full tools set injection
+  if (opencodeCanonical && Array.isArray(body.messages) && (requestFormat === 'chat' || !requestFormat)) {
+    const canonicalPrompt = opencodeCanonical.canonicalOpencodeSystemPrompt(body.model);
+    const first = body.messages[0];
+    const already = first && first.role === 'system' && first.content === canonicalPrompt;
+    const messages = already
+      ? body.messages
+      : [{ role: 'system', content: canonicalPrompt }, ...body.messages];
+
+    const existingTools = Array.isArray(body.tools) ? body.tools : [];
+    const clientToolNames = new Set(
+      existingTools.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean)
+    );
+    const missingTools = opencodeCanonical.OPENCODE_CLI_TOOLS.filter(
+      (tool) => !clientToolNames.has(tool.function.name)
+    );
+    const tools = [...existingTools, ...missingTools];
+
+    return {
+      ...body,
+      stream: true,
+      messages,
+      tools
+    };
+  }
+
   let next = applyFingerprintSystemPrompt({ ...body, stream: true });
   let existing = Array.isArray(next.tools) ? next.tools : [];
-  // P36 fix: CLIProxyAPI의 codex 실행기 등이 자동 주입하는 type:"image_generation"
-  // 같은 비호환 도구는 zen이 타입 자체를 미지원해 403/400으로 거부한다(P24 교훈).
-  // 플레이스홀더를 채우기 전에 이런 비호환 도구를 먼저 걸러낸다.
   existing = existing.filter((t) => t && t.type !== 'image_generation');
-  // P37 fix: zen의 free-tier 게이트는 tools에 opencode CLI 고유 도구 이름(bash/read/write/...)
-  // 이 들어와야만 통과한다(P37 재현 실험). 이전 P36 조건문은 "클라이언트가 보낸 tools가 6개 이상
-  // 이면 그대로 통과"라고 해 Claude Code의 Bash/Read/mcp__* 같은 CLI가 아닌 도구만으로
-  // 6개 채워져도 보강 없이 그대로 zen에 건네면서 403 FreeTierError가 났다.
-  // 클라이언트 도구는 모두 보존하면서 CLI 플레이스홀더와 합집합을 항상 만든다.
   const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean));
   const placeholders = zenPlaceholderToolsFor(requestFormat).filter((t) => {
     const name = (t.function && t.function.name) || t.name;

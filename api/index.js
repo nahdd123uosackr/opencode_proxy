@@ -1,6 +1,19 @@
 'use strict';
 const crypto = require('node:crypto');
 const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/inference/v1';
+const FREE_TIER_INFERENCE_BASE_URL = 'https://opencode.ai/inference/v1';
+
+function getUpstreamUrl(path, isFreeTier) {
+  // 로컬 uTLS 브릿지(127.0.0.1:18791 등)를 거칠 때는 호스트/포트를 유지
+  if (UPSTREAM.includes('127.0.0.1') || UPSTREAM.includes('localhost') || UPSTREAM.includes('192.168.')) {
+    return UPSTREAM + path;
+  }
+  // OmniRoute PR #19128: 무료 모델은 반드시 https://opencode.ai/inference/v1 으로 전송
+  if (isFreeTier) {
+    return FREE_TIER_INFERENCE_BASE_URL + path;
+  }
+  return UPSTREAM + path;
+}
 
 let opencodeCanonical = null;
 try {
@@ -308,13 +321,17 @@ function synthesizeOpencodeId(prefix) {
 // 그래서 세션 id는 canonical 방식(반전 타임스탬프 hex + base62 꼬리)으로 발급하고,
 // 일 단위 고정/키 단위 고정은 "발급된 canonical id를 캐시"하는 방식으로 유지한다.
 const ZEN_TS_MASK = (1n << 48n) - 1n;
+const OPENCODE_SESSION_TS_MAX = 0xfffffffffn; // 36-bit timestamp window (OmniRoute #16328 / opencode2api v1.3.8)
+const OPENCODE_SESSION_COUNTER = 1n;
 const SESSION_COUNTER_MAX = 16;
 let zenIdCounter = 0;
 function canonicalSessionId() {
-  // 9router #5218: counter must wrap in 1..16 (values >=100 give 403 FreeTierError)
-  zenIdCounter = (zenIdCounter % SESSION_COUNTER_MAX) + 1;
-  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter);
-  const inverted = (~units) & ZEN_TS_MASK;
+  // 9router #5218 / OmniRoute PR #19128: 36-bit timestamp within recent UTC day + counter 1
+  const dayMs = 86400000n;
+  const now = BigInt(Date.now());
+  const hashed = BigInt('0x' + crypto.randomBytes(8).toString('hex'));
+  const ts36 = ((now / dayMs) * dayMs - (hashed % dayMs)) & OPENCODE_SESSION_TS_MAX;
+  const inverted = ~((ts36 << 12n) | OPENCODE_SESSION_COUNTER) & ZEN_TS_MASK;
   const hexPart = inverted.toString(16).padStart(12, '0');
   const digest = crypto.randomBytes(14);
   let b62Part = '';
@@ -376,15 +393,15 @@ function extractLastUserText(body) {
   }
   return '';
 }
-// 9router #5381 / #5411 / #5482 (2026-11): OpenCode Zen v2 wire signature parity
-// 1) v2 CLI dev 서명 UA ('opencode/dev/0.0.0-dev-202610272228/opencode')
-// 2) x-opencode-client: 'opencode' (구버전 'cli' 탈피)
-// 3) x-opencode-request: 요청별 고유 req_<24hex> 생성 (삭제 방지)
+// OmniRoute v3.8.54 / PR #19128 / official v2 binary parity:
+// 1) User-Agent: opencode/latest/2.2.5/cli (공식 v2 CLI 정품 서명)
+// 2) x-opencode-client: 'cli'
+// 3) x-opencode-request: v2 프리티어에선 v1 잔재 식별자로 간주되므로 명시적 삭제
 // 4) Connection: close로 소켓/세션 풀링 오염(429 체이닝) 방지
-// 5) prompt_cache_key 세션 바인딩
-const ZEN_UA = process.env.ZEN_UA || 'opencode/dev/0.0.0-dev-202610272228/opencode';
+// 5) prompt_cache_key 바디 주입 제외 (#18787: x-opencode-session 기반 암시적 캐싱)
+const ZEN_UA = process.env.ZEN_UA || 'opencode/latest/2.2.5/cli';
 function randomProjectID() {
-  return crypto.randomBytes(20).toString('hex'); // 40-char git commit sha 형태 (global 대신 독립 버킷)
+  return crypto.randomBytes(20).toString('hex'); // 40-char git commit sha 형태
 }
 
 function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
@@ -395,13 +412,10 @@ function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   h['x-opencode-session'] = sessionId;
   h['x-session-affinity'] = sessionId;
   h['X-Session-Id'] = sessionId;
-  h['x-opencode-client'] = 'opencode';
+  h['x-opencode-client'] = 'cli';
   h['x-opencode-project'] = randomProjectID();
-  h['x-opencode-request'] = 'req_' + crypto.randomBytes(12).toString('hex');
+  delete h['x-opencode-request'];
   h['Connection'] = 'close';
-  if (upstreamBody && typeof upstreamBody === 'object' && !upstreamBody.prompt_cache_key) {
-    upstreamBody.prompt_cache_key = sessionId;
-  }
   if (zenApiKey) {
     h['Authorization'] = zenApiKey.startsWith('Bearer ') ? zenApiKey : `Bearer ${zenApiKey}`;
   } else {
@@ -593,12 +607,17 @@ function applyZenFreeTierContract(body, requestFormat) {
     );
     const tools = [...existingTools, ...missingTools];
 
-    return {
+    const result = {
       ...body,
       stream: true,
       messages,
-      tools
+      tools,
+      _injectedToolNames: missingTools.map((tool) => tool.function.name)
     };
+    if (result.tool_choice === 'none') {
+      delete result.tool_choice;
+    }
+    return result;
   }
 
   let next = applyFingerprintSystemPrompt({ ...body, stream: true });
@@ -1086,7 +1105,87 @@ function capToolsDepth(tools) {
 // P33: free tier 계약이 stream:true를 강제하므로, 클라이언트가 stream:false를
 // 원했던 요청은 SSE로 받은 뒤 여기서 표준 chat.completion JSON으로 재조립한다
 // (OmniRoute PR #14013의 "forced-stream-then-rebuild" 전략과 동일 원칙).
-function rebuildChatJsonFromForcedStream(sseText, model) {
+// OmniRoute PR #19128 (open-sse/executors/opencodeInjectedToolFilter.ts parity):
+// 주입된 도구 호출을 SSE 스트림에서 실시간으로 제거하고, 남은 클라이언트 도구 인덱스를 재정렬하며,
+// 주입된 도구만 호출되었을 경우 finish_reason을 stop으로 전환한다.
+function filterInjectedSSEText(sseText, injectedNames) {
+  if (!injectedNames || !injectedNames.length || !sseText) return sseText;
+  const injected = new Set(injectedNames);
+  const nameByIndex = new Map();
+  const keptIndexes = new Map();
+  const pending = new Map();
+
+  const routeToolCall = (raw) => {
+    const index = typeof raw.index === 'number' ? raw.index : 0;
+    const name = raw.function?.name;
+    if (typeof name === 'string' && name) nameByIndex.set(index, name);
+    const known = nameByIndex.get(index);
+    if (!known) {
+      const held = pending.get(index) ?? [];
+      held.push(raw);
+      pending.set(index, held);
+      return [];
+    }
+    if (injected.has(known)) {
+      pending.delete(index);
+      return [];
+    }
+    const outIndex = keptIndexes.has(index) ? keptIndexes.get(index) : keptIndexes.size;
+    keptIndexes.set(index, outIndex);
+    const held = pending.get(index) ?? [];
+    pending.delete(index);
+    return [...held, raw].map((entry) => ({ ...entry, index: outIndex }));
+  };
+
+  const filterChunk = (chunk) => {
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    for (const choice of choices) {
+      const delta = choice.delta;
+      if (delta && Array.isArray(delta.tool_calls)) {
+        const kept = delta.tool_calls.flatMap(routeToolCall);
+        if (kept.length > 0) delta.tool_calls = kept;
+        else delete delta.tool_calls;
+      }
+      if (choice.finish_reason === 'tool_calls' && keptIndexes.size === 0) {
+        choice.finish_reason = 'stop';
+      }
+    }
+  };
+
+  const lines = sseText.split('\n');
+  const out = [];
+  for (const line of lines) {
+    if (!line.startsWith('data:')) {
+      out.push(line);
+      continue;
+    }
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') {
+      out.push(line);
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(payload);
+      filterChunk(parsed);
+      const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+      const emptyDelta =
+        choices.length === 1 &&
+        choices[0].finish_reason == null &&
+        JSON.stringify(choices[0].delta ?? {}) === '{}' &&
+        !parsed.usage;
+      if (emptyDelta && payload.includes('tool_calls')) continue;
+      out.push(`data: ${JSON.stringify(parsed)}`);
+    } catch {
+      out.push(line);
+    }
+  }
+  return out.join('\n');
+}
+
+function rebuildChatJsonFromForcedStream(sseText, model, injectedNames) {
+  if (injectedNames && injectedNames.length) {
+    sseText = filterInjectedSSEText(sseText, injectedNames);
+  }
   let content = '';
   let role = 'assistant';
   let finishReason = 'stop';
@@ -1251,8 +1350,10 @@ function createAnthropicStreamWriter(write, model, inputTokens) {
   return api;
 }
 
-async function pumpChatSSEToAnthropic(body, aw) {
+async function pumpChatSSEToAnthropic(body, aw, injectedNames) {
   const dec = new TextDecoder(); let buf = ''; let finished = false;
+  const injected = new Set(injectedNames || []);
+  let callerToolCalled = false;
   for await (const chunk of body) {
     buf += dec.decode(chunk, { stream: true });
     let idx;
@@ -1268,14 +1369,22 @@ async function pumpChatSSEToAnthropic(body, aw) {
       if (d.reasoning_content || d.reasoning) aw.thinking(d.reasoning_content || d.reasoning);
       if (Array.isArray(d.tool_calls)) {
         for (const tc of d.tool_calls) {
-          if (tc.id && tc.function?.name) aw.setTool(tc.id, tc.function.name);
+          if (tc.function?.name && injected.has(tc.function.name)) continue;
+          if (tc.id && tc.function?.name) {
+            callerToolCalled = true;
+            aw.setTool(tc.id, tc.function.name);
+          }
           if (tc.function?.arguments) aw.toolArgs(tc.function.arguments);
         }
       }
-      if (ch.finish_reason) { finished = true; aw.end(ch.finish_reason, ev.usage?.completion_tokens); }
+      if (ch.finish_reason) {
+        finished = true;
+        const actualFinish = (ch.finish_reason === 'tool_calls' && !callerToolCalled) ? 'end_turn' : ch.finish_reason;
+        aw.end(actualFinish, ev.usage?.completion_tokens);
+      }
     }
   }
-  if (!finished) aw.end('stop', null);
+  if (!finished) aw.end('end_turn', null);
 }
 
 async function pumpResponsesSSEToAnthropic(body, aw) {
@@ -1843,12 +1952,15 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     // P33: muse 계열이 아닌 다른 '-free' 무료 모델(space-bunny-free/big-pickle/
     // mimo-v2.6-flash-free 등)도 이 /chat/completions 경로에서 동일한 free tier
     // 게이트를 탄다 — tools가 비어있으면 stream:true 강제 + 플레이스홀더 도구 주입.
-    if (!/muse/i.test(upstreamModel) && await isZenFreeTierModel(upstreamModel)) {
+    const isFreeTier = await isZenFreeTierModel(upstreamModel);
+    if (!/muse/i.test(upstreamModel) && isFreeTier) {
       upstreamBody = applyZenFreeTierContract(upstreamBody, 'chat');
     }
 
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey, upstreamBody);
     headers['Cache-Control'] = 'no-store';
+
+    const targetChatUrl = getUpstreamUrl('/chat/completions', isFreeTier);
 
     try {
       let fetchRes;
@@ -1881,7 +1993,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
           return res.end(JSON.stringify(cj));
         }
       } else {
-        fetchRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+        fetchRes = await fetch(targetChatUrl, { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       }
       let bodyText = await fetchRes.text();
 
@@ -1890,7 +2002,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       for (let stage = 1; stage <= 2 && fetchRes.status === 400 && REASONING_PASSBACK_RE.test(bodyText); stage++) {
         console.log(`[reasoning-passback] 400 for ${upstreamModel}, retry stage ${stage}`);
         upstreamBody = relaxReasoningPassback(upstreamBody, stage);
-        fetchRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+        fetchRes = await fetch(targetChatUrl, { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
         bodyText = await fetchRes.text();
       }
 
@@ -1905,7 +2017,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
         console.log(`[Failover] ZenKey failed (${bodyText.slice(0, 80)}), transparently falling back to anonymous session...`);
         const anonHeaders = injectHeaders({ 'Content-Type': 'application/json', 'Accept': body.stream ? 'text/event-stream' : 'application/json' }, null, null, upstreamBody);
         anonHeaders['Cache-Control'] = 'no-store';
-        const anonRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: anonHeaders, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+        const anonRes = await fetch(targetChatUrl, { method: 'POST', headers: anonHeaders, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
         const anonText = await anonRes.text();
         res.writeHead(anonRes.status === 200 ? 200 : anonRes.status, { 'Content-Type': anonRes.headers.get('content-type') || 'application/json', 'Cache-Control': 'no-store' });
         return res.end(anonText);
@@ -1925,14 +2037,15 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
         return res.end(bodyText);
       }
 
+      const injected = upstreamBody._injectedToolNames || [];
       if (body.stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-        return res.end(bodyText);
+        return res.end(filterInjectedSSEText(bodyText, injected));
       } else if (upstreamBody.stream && !body.stream) {
         // P33: 클라이언트는 stream:false를 원했지만 free tier 계약 때문에 upstream엔
         // stream:true로 보냈다 — SSE로 온 응답을 표준 JSON으로 재조립해서 돌려준다.
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify(rebuildChatJsonFromForcedStream(bodyText, upstreamModel)));
+        return res.end(JSON.stringify(rebuildChatJsonFromForcedStream(bodyText, upstreamModel, injected)));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(bodyText);
@@ -2019,14 +2132,15 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
         return res.end(JSON.stringify(anthRes));
       }
 
-      fetchRes = await fetch(UPSTREAM + '/chat/completions', { method: 'POST', headers: headers, body: JSON.stringify(openReq), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      const isFreeTier = await isZenFreeTierModel(upstreamModel);
+      fetchRes = await fetch(getUpstreamUrl('/chat/completions', isFreeTier), { method: 'POST', headers: headers, body: JSON.stringify(openReq), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       if (!fetchRes.ok) { const t = await fetchRes.text(); res.writeHead(fetchRes.status, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: t.slice(0, 500) } })); }
 
       if (body.stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
         if (res.flushHeaders) res.flushHeaders();
         const aw = createAnthropicStreamWriter(c => res.write(c), upstreamModel, 0);
-        await pumpChatSSEToAnthropic(fetchRes.body, aw);
+        await pumpChatSSEToAnthropic(fetchRes.body, aw, openReq._injectedToolNames);
         return res.end();
       }
 
@@ -2037,7 +2151,9 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       if (msg.reasoning_content) contentBlocks.push({ type: 'thinking', thinking: msg.reasoning_content });
       if (msg.content) contentBlocks.push({ type: 'text', text: msg.content });
       if (Array.isArray(msg.tool_calls)) {
+        const injected = new Set(openReq._injectedToolNames || []);
         for (const tc of msg.tool_calls) {
+          if (tc.function?.name && injected.has(tc.function.name)) continue;
           let parsedInput = {}; try { parsedInput = JSON.parse(tc.function?.arguments || '{}'); } catch {}
           contentBlocks.push({ type: 'tool_use', id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`, name: tc.function?.name || '', input: parsedInput });
         }
@@ -2357,14 +2473,25 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       headers['Accept'] = 'text/event-stream';
     }
     try {
-      const fr = await fetch(UPSTREAM + NATIVE_PASSTHROUGH_ROUTES[pathname], { method: 'POST', headers, body: outBody, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+      const isReqFree = await isZenFreeTierModel(reqModel);
+      const targetPassthroughUrl = getUpstreamUrl(NATIVE_PASSTHROUGH_ROUTES[pathname], isReqFree);
+      const fr = await fetch(targetPassthroughUrl, { method: 'POST', headers, body: outBody, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       const ct = fr.headers.get('content-type') || 'application/json';
       res.writeHead(fr.status, { 'Content-Type': ct, 'Cache-Control': 'no-store' });
+      const injected = (patched && patched._injectedToolNames) || [];
       if (isStream && fr.body && ct.includes('text/event-stream')) {
+        if (injected.length > 0) {
+          const rawText = await fr.text();
+          return res.end(filterInjectedSSEText(rawText, injected));
+        }
         for await (const chunk of fr.body) res.write(chunk);
         return res.end();
       }
-      return res.end(await fr.text());
+      const rawText = await fr.text();
+      if (injected.length > 0 && ct.includes('text/event-stream')) {
+        return res.end(filterInjectedSSEText(rawText, injected));
+      }
+      return res.end(rawText);
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: e.message } }));

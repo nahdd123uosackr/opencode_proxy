@@ -126,10 +126,16 @@ function synthesizeOpencodeId(prefix: string): string {
 // (~(ms*4096+counter)의 하위 48비트)인지 검사한다 — 랜덤/해시 비트는 403.
 // 9router #5218: counter는 1..16 범위에서 순환해야 통과(100 이상은 403).
 let zenIdCounter = 0;
+const OPENCODE_SESSION_TS_MAX = 0xfffffffffn;
+const OPENCODE_SESSION_COUNTER = 1n;
 function canonicalSessionId(): string {
-  zenIdCounter = (zenIdCounter % 16) + 1;
-  const units = BigInt(Date.now()) * 4096n + BigInt(zenIdCounter);
-  const inverted = ~units & ((1n << 48n) - 1n);
+  const dayMs = 86400000n;
+  const now = BigInt(Date.now());
+  const randBytes = crypto.getRandomValues(new Uint8Array(8));
+  let hashVal = 0n;
+  for (const b of randBytes) hashVal = (hashVal << 8n) | BigInt(b);
+  const ts36 = ((now / dayMs) * dayMs - (hashVal % dayMs)) & OPENCODE_SESSION_TS_MAX;
+  const inverted = ~((ts36 << 12n) | OPENCODE_SESSION_COUNTER) & ((1n << 48n) - 1n);
   const hexPart = inverted.toString(16).padStart(12, '0');
   const digest = crypto.getRandomValues(new Uint8Array(14));
   let b62Part = '';
@@ -177,8 +183,13 @@ function extractLastUserText(body: any): string {
   }
   return '';
 }
-// 9router #5381 / #5411 / #5482 (2026-11): OpenCode Zen v2 wire signature parity
-const ZEN_UA = Deno.env.get('ZEN_UA') || 'opencode/dev/0.0.0-dev-202610272228/opencode';
+// OmniRoute v3.8.54 / PR #19128 / official v2 binary parity:
+// 1) User-Agent: opencode/latest/2.2.5/cli
+// 2) x-opencode-client: 'cli'
+// 3) x-opencode-request: v2 프리티어에선 v1 잔재 식별자로 간주되므로 명시적 삭제
+// 4) Connection: close로 소켓/세션 풀링 오염(429 체이닝) 방지
+// 5) prompt_cache_key 바디 주입 제외 (#18787: x-opencode-session 기반 암시적 캐싱)
+const ZEN_UA = Deno.env.get('ZEN_UA') || 'opencode/latest/2.2.5/cli';
 // injectHeaders가 async가 됐다 — 호출부는 모두 await 해야 한다.
 async function injectHeaders(headers: any, upstreamBody?: any) {
   const h = { ...headers };
@@ -188,13 +199,10 @@ async function injectHeaders(headers: any, upstreamBody?: any) {
   h['x-opencode-session'] = sessionId;
   h['x-session-affinity'] = sessionId;
   h['X-Session-Id'] = sessionId;
-  h['x-opencode-client'] = 'opencode';
+  h['x-opencode-client'] = 'cli';
   h['x-opencode-project'] = crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().replace(/-/g,'').slice(0,8);
-  h['x-opencode-request'] = 'req_' + crypto.randomUUID().replace(/-/g,'').slice(0,24);
+  delete h['x-opencode-request'];
   h['Connection'] = 'close';
-  if (upstreamBody && typeof upstreamBody === 'object' && !upstreamBody.prompt_cache_key) {
-    upstreamBody.prompt_cache_key = sessionId;
-  }
   return h;
 }
 

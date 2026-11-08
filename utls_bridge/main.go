@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -19,18 +22,74 @@ var (
 	targetPort = "443"
 )
 
-func newBunTransport() *http.Transport {
+func dialCONNECT(ctx context.Context, proxyURL *url.URL, targetAddr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", proxyURL.Host)
+	if err != nil {
+		return nil, fmt.Errorf("dial proxy: %w", err)
+	}
+
+	req := &http.Request{
+		Method: "CONNECT",
+		URL:    &url.URL{Opaque: targetAddr},
+		Host:   targetAddr,
+		Header: make(http.Header),
+	}
+	if proxyURL.User != nil {
+		user := proxyURL.User.Username()
+		pass, _ := proxyURL.User.Password()
+		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
+	}
+
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write CONNECT: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read CONNECT resp: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		conn.Close()
+		return nil, fmt.Errorf("CONNECT status %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	if br.Buffered() > 0 {
+		return &bufferedConn{Conn: conn, br: br}, nil
+	}
+	return conn, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	br *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	return b.br.Read(p)
+}
+
+func newBunTransport(proxyURL *url.URL) *http.Transport {
 	return &http.Transport{
-		Proxy:                 nil, // direct
+		Proxy:                 nil, // direct or handled in DialTLSContext via CONNECT
 		DisableKeepAlives:     true, // PR #5381 / #5411: clean socket teardown, prevents 429 pooling poisoning
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialer := &net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
+			var raw net.Conn
+			var err error
+			if proxyURL != nil {
+				raw, err = dialCONNECT(ctx, proxyURL, addr)
+			} else {
+				dialer := &net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}
+				raw, err = dialer.DialContext(ctx, network, addr)
 			}
-			raw, err := dialer.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -59,13 +118,33 @@ func newBunTransport() *http.Transport {
 func main() {
 	port := flag.Int("port", 18791, "listen port for uTLS bridge")
 	host := flag.String("host", "127.0.0.1", "listen host")
+	proxyFlag := flag.String("proxy", "", "upstream HTTP proxy URL (e.g. http://user:pass@host:port)")
 	flag.Parse()
 
 	if envPort := os.Getenv("UTLS_PORT"); envPort != "" {
 		fmt.Sscanf(envPort, "%d", port)
 	}
 
-	transport := newBunTransport()
+	proxyRaw := *proxyFlag
+	if proxyRaw == "" {
+		proxyRaw = os.Getenv("PROXY_URL")
+	}
+	if proxyRaw == "" {
+		proxyRaw = os.Getenv("HTTPS_PROXY")
+	}
+	if proxyRaw == "" {
+		proxyRaw = os.Getenv("HTTP_PROXY")
+	}
+	var proxyURL *url.URL
+	if proxyRaw != "" {
+		var err error
+		proxyURL, err = url.Parse(proxyRaw)
+		if err != nil {
+			log.Fatalf("invalid proxy URL: %v", err)
+		}
+	}
+
+	transport := newBunTransport(proxyURL)
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   300 * time.Second, // allow long LLM stream

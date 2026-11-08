@@ -618,9 +618,16 @@ function applyZenFreeTierContract(body, requestFormat) {
       ...body,
       stream: true,
       messages,
-      tools,
-      _injectedToolNames: missingTools.map((tool) => tool.function.name)
+      tools
     };
+    // 주입 도구 이름은 로컬 후처리용 메타데이터 — JSON.stringify/스프레드로 업스트림에
+    // 새지 않도록 non-enumerable로 붙인다 (enumerable이면 upstream이 400을 반환).
+    Object.defineProperty(result, '_injectedToolNames', {
+      value: missingTools.map((tool) => tool.function.name),
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
     if (result.tool_choice === 'none') {
       delete result.tool_choice;
     }

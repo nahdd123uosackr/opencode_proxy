@@ -38,7 +38,12 @@ const utlsBin = utlsCandidates.find(p => {
 
 if (utlsBin && !process.env.DISABLE_UTLS) {
   try {
-    utlsChild = spawn(utlsBin, ['-port', UTLS_PORT], {
+    const utlsArgs = ['-port', UTLS_PORT];
+    const proxyArg = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    if (proxyArg) {
+      utlsArgs.push('-proxy', proxyArg);
+    }
+    utlsChild = spawn(utlsBin, utlsArgs, {
       stdio: ['ignore', 'inherit', 'inherit']
     });
     console.log(`[uTLS] spawned Bun BoringSSL bridge (${utlsBin}) on port ${UTLS_PORT}`);

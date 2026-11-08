@@ -1130,6 +1130,8 @@ function filterInjectedSSEText(sseText, injectedNames) {
   const pending = new Map();
 
   const routeToolCall = (raw) => {
+    // 빈 플레이스홀더는 보류(pending)시키면 뒤의 실제 호출과 함께 방출되므로 여기서 버린다.
+    if (isEmptyToolCallDelta(raw)) return [];
     const index = typeof raw.index === 'number' ? raw.index : 0;
     const name = raw.function?.name;
     if (typeof name === 'string' && name) nameByIndex.set(index, name);
@@ -1196,6 +1198,21 @@ function filterInjectedSSEText(sseText, injectedNames) {
   return out.join('\n');
 }
 
+// 9router 9cd0003 (stream-empty-tool-call-delta) 대응: upstream은 인덱스만 있고
+// id/name/arguments가 모두 빈 tool_calls 델타를 먼저 보내는 경우가 있다. 이걸
+// 그대로 조립하면 name=""인 유령 도구 호출이 만들어지므로 먼저 걸러낸다.
+// 확장 필드가 섞인 페이로드는 우리가 이해하지 못하는 형태이므로 보존한다.
+function isEmptyToolCallDelta(tc) {
+  if (!tc || typeof tc !== 'object') return false;
+  if (tc.type && tc.type !== 'function') return false;
+  if (Object.keys(tc).some((k) => !['index', 'id', 'type', 'function'].includes(k))) return false;
+  if (Object.keys(tc.function || {}).some((k) => !['name', 'arguments'].includes(k))) return false;
+  return !['id', 'name', 'arguments'].some((f) => {
+    const v = f === 'name' || f === 'arguments' ? tc.function?.[f] : tc[f];
+    return v != null && v !== '';
+  });
+}
+
 function rebuildChatJsonFromForcedStream(sseText, model, injectedNames) {
   if (injectedNames && injectedNames.length) {
     sseText = filterInjectedSSEText(sseText, injectedNames);
@@ -1205,6 +1222,8 @@ function rebuildChatJsonFromForcedStream(sseText, model, injectedNames) {
   let finishReason = 'stop';
   let usage = null;
   let id = `chatcmpl-${crypto.randomUUID().slice(0, 8)}`;
+  const toolCalls = [];
+  const toolCallByIndex = new Map();
   for (const line of sseText.split('\n')) {
     const t = line.trim();
     if (!t.startsWith('data:')) continue;
@@ -1218,12 +1237,33 @@ function rebuildChatJsonFromForcedStream(sseText, model, injectedNames) {
     const delta = choice.delta || {};
     if (delta.role) role = delta.role;
     if (typeof delta.content === 'string') content += delta.content;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        if (isEmptyToolCallDelta(tc)) continue;
+        const idx = typeof tc.index === 'number' ? tc.index : toolCalls.length;
+        let entry = toolCallByIndex.get(idx);
+        if (!entry) {
+          entry = { id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`, type: 'function', function: { name: tc.function?.name || '', arguments: '' } };
+          toolCallByIndex.set(idx, entry);
+          toolCalls.push(entry);
+        } else {
+          if (tc.id) entry.id = tc.id;
+          if (tc.function?.name) entry.function.name = tc.function.name;
+        }
+        if (tc.function?.arguments) entry.function.arguments += tc.function.arguments;
+      }
+    }
     if (choice.finish_reason) finishReason = choice.finish_reason;
     if (evt.usage) usage = evt.usage;
   }
+  const message = { role, content };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  // 남은 도구 호출이 없으면 tool_calls 종료 사유는 거짓이 된다 (클라이언트가 빈
+  // 배열을 기대하다 멈추는 응답 형태) — 텍스트 종료로 정정한다.
+  if (toolCalls.length === 0 && finishReason === 'tool_calls') finishReason = 'stop';
   return {
     id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, message: { role, content }, finish_reason: finishReason }],
+    choices: [{ index: 0, message, finish_reason: finishReason }],
     usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
 }

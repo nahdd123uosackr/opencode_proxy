@@ -393,15 +393,19 @@ function extractLastUserText(body) {
   }
   return '';
 }
-// OmniRoute v3.8.54 / PR #19128 / official v2 binary parity:
-// 1) User-Agent: opencode/latest/2.2.5/cli (공식 v2 CLI 정품 서명)
-// 2) x-opencode-client: 'cli'
-// 3) x-opencode-request: v2 프리티어에선 v1 잔재 식별자로 간주되므로 명시적 삭제
-// 4) Connection: close로 소켓/세션 풀링 오염(429 체이닝) 방지
-// 5) prompt_cache_key 바디 주입 제외 (#18787: x-opencode-session 기반 암시적 캐싱)
-const ZEN_UA = process.env.ZEN_UA || 'opencode/latest/2.2.5/cli';
-function randomProjectID() {
-  return crypto.randomBytes(20).toString('hex'); // 40-char git commit sha 형태
+// 9router PR #5381 & OmniRoute v3.8.54 / PR #19128 dev wire signature parity:
+// 1) User-Agent: opencode/dev/0.0.0-dev-202610272228/opencode (dev 와이어 서명)
+// 2) x-opencode-client: 'opencode'
+// 3) x-opencode-request: req_<24hex> (매 요청별 고유 요청 ID)
+// 4) x-opencode-project: 세션 기반 40-hex sha1 해시 (단일 버킷 충돌 방지)
+// 5) Connection: close로 소켓/세션 풀링 오염(429 체이닝) 방지
+// 6) prompt_cache_key: 세션 바인딩
+const ZEN_UA = process.env.ZEN_UA || 'opencode/dev/0.0.0-dev-202610272228/opencode';
+function generateProjectId(session) {
+  if (session && typeof session === 'string') {
+    return crypto.createHash('sha1').update('project:' + session).digest('hex');
+  }
+  return crypto.randomBytes(20).toString('hex');
 }
 
 function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
@@ -412,10 +416,13 @@ function injectHeaders(headers, relay, zenApiKey, upstreamBody) {
   h['x-opencode-session'] = sessionId;
   h['x-session-affinity'] = sessionId;
   h['X-Session-Id'] = sessionId;
-  h['x-opencode-client'] = 'cli';
-  h['x-opencode-project'] = randomProjectID();
-  delete h['x-opencode-request'];
+  h['x-opencode-client'] = 'opencode';
+  h['x-opencode-project'] = generateProjectId(sessionId);
+  h['x-opencode-request'] = 'req_' + crypto.randomBytes(12).toString('hex');
   h['Connection'] = 'close';
+  if (upstreamBody && typeof upstreamBody === 'object' && !upstreamBody.prompt_cache_key) {
+    upstreamBody.prompt_cache_key = sessionId;
+  }
   if (zenApiKey) {
     h['Authorization'] = zenApiKey.startsWith('Bearer ') ? zenApiKey : `Bearer ${zenApiKey}`;
   } else {

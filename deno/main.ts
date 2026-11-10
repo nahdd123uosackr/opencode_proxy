@@ -517,6 +517,9 @@ async function mintDahlToken() {
   return j.token;
 }
 async function getDahlToken(forceNew) {
+  // DAHL_API_KEY가 있으면 무인증 POST /tokens(2026-10-31 이후 Turnstile 403) 대신 이 키를 그대로 사용한다.
+  const envKey = (Deno.env.get('DAHL_API_KEY') || '').trim();
+  if (envKey) return envKey;
   const now = Date.now();
   if (!forceNew && dahlTokenCache && (now - dahlTokenCacheTime) < DAHL_TOKEN_TTL) return dahlTokenCache;
   const token = await mintDahlToken();

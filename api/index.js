@@ -1852,7 +1852,7 @@ const handle = async (req, res) => {
         const explicitKey = clientAuth.replace(/^Bearer\s+/i, '').trim();
         const useExplicit = explicitKey.startsWith('dahl_') ? explicitKey : null;
 
-        for (let attempt = 0; attempt < (isDahl ? 2 : 1); attempt++) {
+        for (let attempt = 0; attempt < 1; attempt++) {
           if (isDahl) uHeaders['Authorization'] = `Bearer ${useExplicit || await getDahlToken(attempt > 0)}`;
           fr = await fetch(upstreamBase + '/v1/chat/completions', {
             method: 'POST',
@@ -1861,7 +1861,7 @@ const handle = async (req, res) => {
             signal: AbortSignal.timeout(parseInt(process.env.UNCLOSEAI_DAHL_TIMEOUT_MS || '120000', 10)),
           });
           // dahl 토큰이 (관찰된 적은 없지만) 무효화됐을 가능성에 대비: 인증 실패면 재발급 1회 재시도
-          if (isDahl && (fr.status === 401 || fr.status === 403) && attempt === 0) continue;
+          // no-failover: return error directly
           break;
         }
         if (body.stream && fr.ok) {
@@ -2198,7 +2198,14 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
         return res.end();
       }
 
-      const openJson = await fetchRes.json();
+      let openJson;
+      const ct = fetchRes.headers.get("content-type") || "";
+      if (ct.includes("text/event-stream") || openReq.stream) {
+        const rawText = await fetchRes.text();
+        openJson = rebuildChatJsonFromForcedStream(rawText, upstreamModel, openReq._injectedToolNames);
+      } else {
+        openJson = await fetchRes.json();
+      }
       const choice = (openJson.choices && openJson.choices[0]) || {};
       const msg = choice.message || {};
       const contentBlocks = [];
@@ -2692,13 +2699,13 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
 
     try {
       let dr;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 1; attempt++) {
         dHeaders['Authorization'] = `Bearer ${explicitDahlKey || await getDahlToken(attempt > 0)}`;
         dr = await fetch(DAHL_BASE + '/v1/chat/completions', {
           method: 'POST', headers: dHeaders, body: JSON.stringify({ ...body, model: realModel }),
           signal: AbortSignal.timeout(parseInt(process.env.UNCLOSEAI_DAHL_TIMEOUT_MS || '120000', 10)),
         });
-        if ((dr.status === 401 || dr.status === 403) && attempt === 0) continue;
+        // no-failover: return error directly
         break;
       }
       const ct = dr.headers.get('content-type') || 'application/json';

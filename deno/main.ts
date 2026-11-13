@@ -1362,10 +1362,10 @@ export default {
 
       try {
         let dr;
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 1; attempt++) {
           dHeaders.Authorization = `Bearer ${explicitDahlKey || await getDahlToken(attempt > 0)}`;
           dr = await fetch(DAHL_BASE + '/v1/chat/completions', { method: 'POST', headers: dHeaders, body: JSON.stringify({ ...pbody, model: realModel }) });
-          if ((dr.status === 401 || dr.status === 403) && attempt === 0) continue;
+          // no-failover: return error directly
           break;
         }
         if (isStream && dr.ok) {
@@ -1470,11 +1470,11 @@ export default {
         const explicitKey = clientAuth.replace(/^Bearer\s+/i, '').trim();
         const useExplicit = explicitKey.startsWith('dahl_') ? explicitKey : null;
 
-        for (let attempt = 0; attempt < (isDahl ? 2 : 1); attempt++) {
+        for (let attempt = 0; attempt < 1; attempt++) {
           if (isDahl) uHeaders.Authorization = `Bearer ${useExplicit || await getDahlToken(attempt > 0)}`;
           ur = await fetch(upstreamBase + '/v1/chat/completions', { method: 'POST', headers: uHeaders, body: JSON.stringify({ ...body, model: realModel }) });
           // dahl 토큰이 (관찰된 적은 없지만) 무효화됐을 가능성에 대비: 인증 실패면 재발급 1회 재시도
-          if (isDahl && (ur.status === 401 || ur.status === 403) && attempt === 0) continue;
+          // no-failover: return error directly
           break;
         }
         if (isStream && ur.ok) {
@@ -1575,6 +1575,9 @@ export default {
           // 포워드 / JSON 파싱 후 Anthropic 변환)가 동일하게 적용된다.
           r = await museChatResponse(upstreamModel, full, variant, isStream);
         } else {
+          if (/deepseek/i.test(upstreamModel) && full.response_format) {
+            delete full.response_format;
+          }
           r = await forward('/chat/completions', full, isStream);
         }
         if (isStream) return forwardStreamOrJson(r, true);

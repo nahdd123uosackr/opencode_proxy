@@ -2014,6 +2014,9 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': (body.stream || upstreamBody.stream) ? 'text/event-stream' : 'application/json' }, null, zenApiKey, upstreamBody);
     headers['Cache-Control'] = 'no-store';
 
+    if (/deepseek/i.test(upstreamModel) && upstreamBody.response_format) {
+      delete upstreamBody.response_format;
+    }
     const targetChatUrl = getUpstreamUrl('/chat/completions', isFreeTier);
 
     try {
@@ -2187,6 +2190,9 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       }
 
       const isFreeTier = await isZenFreeTierModel(upstreamModel);
+      if (/deepseek/i.test(upstreamModel) && openReq.response_format) {
+        delete openReq.response_format;
+      }
       fetchRes = await fetch(getUpstreamUrl('/chat/completions', isFreeTier), { method: 'POST', headers: headers, body: JSON.stringify(openReq), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
       if (!fetchRes.ok) { const t = await fetchRes.text(); res.writeHead(fetchRes.status, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: t.slice(0, 500) } })); }
 

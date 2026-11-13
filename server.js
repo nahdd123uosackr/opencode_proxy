@@ -25,11 +25,15 @@ const { spawn } = require('child_process');
 // --- uTLS Bun BoringSSL Bridge Integration ---
 let utlsChild = null;
 const UTLS_PORT = process.env.UTLS_PORT || '18791';
+const isArm = process.arch === "arm64";
+const archBinary = isArm ? "utls_bridge_arm64" : "utls_bridge_amd64";
 const utlsCandidates = [
-  path.join(__dirname, 'utls_bridge', 'utls_bridge'),
-  path.join(__dirname, 'utls_bridge'),
-  '/opt/opencode-proxy/utls_bridge',
-  '/usr/local/bin/utls_bridge'
+  path.join(__dirname, "utls_bridge", archBinary),
+  path.join(__dirname, "utls_bridge", "utls_bridge"),
+  path.join(__dirname, archBinary),
+  path.join(__dirname, "utls_bridge"),
+  "/opt/opencode-proxy/utls_bridge",
+  "/usr/local/bin/utls_bridge"
 ];
 
 const utlsBin = utlsCandidates.find(p => {
@@ -38,6 +42,7 @@ const utlsBin = utlsCandidates.find(p => {
 
 if (utlsBin && !process.env.DISABLE_UTLS) {
   try {
+    try { fs.chmodSync(utlsBin, 0o755); } catch (_) {}
     const utlsArgs = ['-port', UTLS_PORT];
     const proxyArg = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     if (proxyArg) {

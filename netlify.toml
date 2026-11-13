@@ -3,7 +3,7 @@
 
 [functions]
   node_bundler = "esbuild"
-  included_files = ["api/**"]
+  included_files = ["api/**", "api/opencodeCanonical.js"]
 
 # 모든 API 요청 및 헬스체크를 api/index.js로 라우팅
 [[redirects]]

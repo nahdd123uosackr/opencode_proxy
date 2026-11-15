@@ -1,2 +1,6 @@
 .vercel
-redeploy.sh
+*.bak-*
+*.bak
+convex/node_modules
+convex/.convex
+convex/.env*

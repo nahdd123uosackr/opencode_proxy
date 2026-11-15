@@ -1,5 +1,21 @@
 'use strict';
 
+// Runtime-neutral env access: Deno.env under `deno deploy`, process.env under a
+// Node host, and the handler `env` argument under the Convex HTTP action.
+const ENV: Record<string, string | undefined> = (() => {
+  try {
+    if (typeof Deno !== 'undefined') return Deno.env.toObject();
+  } catch {}
+  const proc = (globalThis as any).process;
+  return proc && proc.env ? { ...proc.env } : {};
+})();
+function envGet(key: string): string | undefined {
+  return ENV[key];
+}
+function envPrime(extra: unknown): void {
+  if (extra && typeof extra === 'object') Object.assign(ENV, extra);
+}
+
 const UPSTREAM = 'https://opencode.ai/inference/v1';
 const PROXY_API_KEY = ''; // set via wrangler secret PROXY_API_KEY if needed
 
@@ -14,7 +30,7 @@ const KNOWN_FREE_EXTRA = new Set(['big-pickle', 'grok-code']);
 //                @ai-sdk/google -> gemini-native, 그 외(npm 없음, mistral 등) -> chat
 // 카탈로그에 없는 모델(신규 모델 등)은 deprecated로 취급하지 않는다 — 목록에 없다고 폐기된 것은 아니다.
 // 카탈로그 fetch가 실패하면 마지막으로 성공한 값을 계속 쓰고, 처음부터 없으면 null(=이름 패턴 휴리스틱 + 하드코딩 폴백).
-const ZEN_CATALOG_URL = (() => { try { return Deno.env.get('ZEN_CATALOG_URL') || 'https://models.opencode.ai/api.json'; } catch { return 'https://models.opencode.ai/api.json'; } })();
+const ZEN_CATALOG_URL = envGet('ZEN_CATALOG_URL') || 'https://models.opencode.ai/api.json';
 const ZEN_CATALOG_TTL = 6 * 60 * 60 * 1000;
 const ZEN_CATALOG_RETRY_MS = 60 * 1000; // 실패 직후 매 요청마다 8초 타임아웃을 반복하지 않도록
 type ZenCatalog = { protocols: Record<string, string>; free: Set<string>; deprecated: Set<string> };
@@ -142,7 +158,7 @@ function canonicalSessionId(): string {
   for (const byte of digest) b62Part += ZEN_B62[byte % 62];
   return 'ses_' + hexPart + b62Part;
 }
-const ZEN_SESSION_MODE = (() => { try { return Deno.env.get('ZEN_SESSION_MODE') || 'stable'; } catch { return 'stable'; } })();
+const ZEN_SESSION_MODE = envGet('ZEN_SESSION_MODE') || 'stable';
 let zenAnonSession: { id: string; day: string } | null = null;
 async function sha256Digest(text: string): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
@@ -190,7 +206,7 @@ function extractLastUserText(body: any): string {
 // 4) x-opencode-project: 40자리 sha1 해시 (세션 격리)
 // 5) Connection: close로 소켓/세션 풀링 오염(429 체이닝) 방지
 // 6) prompt_cache_key: 세션 바인딩
-const ZEN_UA = Deno.env.get('ZEN_UA') || 'opencode/dev/0.0.0-dev-202610272228/opencode';
+const ZEN_UA = envGet('ZEN_UA') || 'opencode/dev/0.0.0-dev-202610272228/opencode';
 // injectHeaders가 async가 됐다 — 호출부는 모두 await 해야 한다.
 async function injectHeaders(headers: any, upstreamBody?: any) {
   const h = { ...headers };
@@ -402,8 +418,15 @@ function collectResponsesObjectFromSSE(sseText: string) {
   }
   return finalResponse;
 }
+/** True for our own client-facing proxy keys (pool keys, generated fk_ keys, env secrets). */
+function isProxyKey(authHeader: string): boolean {
+  const k = String(authHeader || '').replace(/^Bearer\s+/i, '').trim();
+  if (!k) return false;
+  return /^fk_/i.test(k) || /^c\d+$/i.test(k) || k === envGet('PROXY_API_KEY') || k === envGet('FREE_AI_KEY');
+}
+
 function authOk(request, env) {
-  const key = env.PROXY_API_KEY || PROXY_API_KEY;
+  const key = (env && env.PROXY_API_KEY) || envGet('PROXY_API_KEY') || PROXY_API_KEY;
   if (!key) return true;
   const apiKey = request.headers.get('x-api-key') || (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '') || request.headers.get('x-proxy-key');
   return apiKey === key;
@@ -434,7 +457,7 @@ let modelsCache = null, modelsCacheTime = 0;
 const MODELS_TTL = 60 * 60 * 1000;
 
 // === Kilo Gateway 프로바이더 (무료 모델만, 인증 불필요) ===
-const KILO_BASE = (() => { try { return Deno.env.get('KILO_BASE') || 'https://ai-gateway.kilo.ai/api/v1'; } catch { return 'https://ai-gateway.kilo.ai/api/v1'; } })();
+const KILO_BASE = envGet('KILO_BASE') || 'https://ai-gateway.kilo.ai/api/v1';
 let kiloModelsCache = null;
 let kiloModelsCacheTime = 0;
 async function getKiloFreeModels() {
@@ -518,7 +541,7 @@ async function mintDahlToken() {
 }
 async function getDahlToken(forceNew) {
   // DAHL_API_KEY가 있으면 무인증 POST /tokens(2026-10-31 이후 Turnstile 403) 대신 이 키를 그대로 사용한다.
-  const envKey = (Deno.env.get('DAHL_API_KEY') || '').trim();
+  const envKey = (envGet('DAHL_API_KEY') || '').trim();
   if (envKey) return envKey;
   const now = Date.now();
   if (!forceNew && dahlTokenCache && (now - dahlTokenCacheTime) < DAHL_TOKEN_TTL) return dahlTokenCache;
@@ -838,7 +861,7 @@ function capSchemaDepth(node, maxDepth, depth) {
   }
   return out;
 }
-const MAX_TOOL_SCHEMA_DEPTH = parseInt(process.env.MAX_TOOL_SCHEMA_DEPTH || '9', 10);
+const MAX_TOOL_SCHEMA_DEPTH = parseInt(envGet("MAX_TOOL_SCHEMA_DEPTH") || '9', 10);
 function capToolSchemaDepth(tool) {
   if (!tool || typeof tool !== 'object') return tool;
   const t = { ...tool };
@@ -887,7 +910,7 @@ function totalPromptTokensForInput(input, instructions) {
   return t;
 }
 function truncateMessagesIfNeeded(messages, instructions, maxTokens) {
-  const MAX = maxTokens || parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  const MAX = maxTokens || parseInt(envGet("PROMPT_MAX_TOKENS") || '700000', 10);
   if (!Array.isArray(messages) || !messages.length) return messages;
   let total = totalPromptTokensForMessages(messages, instructions);
   if (total <= MAX) return messages;
@@ -914,7 +937,7 @@ function truncateMessagesIfNeeded(messages, instructions, maxTokens) {
   return truncated;
 }
 function truncateInputIfNeeded(input, instructions, maxTokens) {
-  const MAX = maxTokens || parseInt(process.env.PROMPT_MAX_TOKENS || '700000', 10);
+  const MAX = maxTokens || parseInt(envGet("PROMPT_MAX_TOKENS") || '700000', 10);
   if (!Array.isArray(input) || !input.length) return input;
   let total = totalPromptTokensForInput(input, instructions);
   if (total <= MAX) return input;
@@ -1034,8 +1057,8 @@ async function forwardStreamOrJson(upstreamRes, isStream) {
   return new Response(text, { status: upstreamRes.status, headers: { ...CORS, 'Content-Type': 'application/json' } });
 }
 
-export default {
-  async fetch(request, env) {
+export async function handleRequest(request: Request, env?: unknown): Promise<Response> {
+    envPrime(env);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
     const url = new URL(request.url);
     let pathname = url.pathname;
@@ -1275,7 +1298,8 @@ export default {
       const isStream = !!pbody.stream;
       const kHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
       const clientAuth = request.headers.get('authorization');
-      if (clientAuth) kHeaders.Authorization = clientAuth;
+      // Only forward a real Kilo key; the pool's own proxy key is meaningless upstream and Kilo 401s on it.
+      if (clientAuth && !isProxyKey(clientAuth)) kHeaders.Authorization = clientAuth;
       // Kilo가 라우팅하는 모델(예: kilo-auto)에 자체적으로 reasoning.effort를 강제 배정해서
       // 클라이언트가 보낸 reasoning_effort와 충돌하면 400을 낸다(P17) — 이 전용 경로도 동일 방어.
       const kiloBody = { ...pbody, model: realModel, messages: msgs };
@@ -1414,7 +1438,7 @@ export default {
     if (!body.model) return json({ error: { message: 'model required' } }, 400);
     {
       // reasoning 모델이 작은 max_tokens를 추론에 소진하는 것 방지
-      const mmT = parseInt(process.env.MIN_MAX_TOKENS || '1024', 10);
+      const mmT = parseInt(envGet("MIN_MAX_TOKENS") || '1024', 10);
       for (const k of ['max_tokens', 'max_completion_tokens', 'max_output_tokens']) {
         if (typeof body[k] === 'number' && body[k] < mmT) body[k] = mmT;
       }
@@ -1439,7 +1463,7 @@ export default {
         }
         const kHeaders = { 'Content-Type': 'application/json', Accept: isStream ? 'text/event-stream' : 'application/json' };
         const clientAuth = request.headers.get('authorization');
-        if (clientAuth) kHeaders.Authorization = clientAuth;
+        if (clientAuth && !isProxyKey(clientAuth)) kHeaders.Authorization = clientAuth;
         // P17 fix (2026-09-11, corrected): live diagnostic logging on oracle2
         // showed the real failing requests carry ONLY reasoning_effort --
         // reasoning (the structured object) is absent entirely. So this is
@@ -1602,5 +1626,6 @@ export default {
     }
 
     return json({ error: { message: `Not found: ${request.method} ${pathname}` } }, 404);
-  }
-};
+}
+
+export default { fetch: handleRequest };

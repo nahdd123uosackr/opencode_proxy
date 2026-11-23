@@ -1707,22 +1707,19 @@ const handle = async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, `https://${req.headers.host}`);
   let pathname = url.pathname;
+  if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
 
-  // 2026-10-26: /opencode/v1/* 전용 접두사 라우트. Kilo(/kilo/v1/*), Dahl(/dahl/v1/*)와 같은
-  // 형태로, 게이트웨이가 프로바이더 이름을 경로 접두사로 붙여 보내는 클라이언트
-  // (예: OmniRoute의 opencode-key-chat 프로바이더)를 받아준다. 접두사만 벗겨서
-  // 기존 /v1/* 처리 경로를 그대로 재사용한다 — zen 전용 동작(무료 티어 계약,
-  // 프로토콜 분기, 모델 판별)을 중복 구현하지 않기 위해서다.
+  // 1) Stormkit / Serverless /api prefix stripping (must precede provider route matching)
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    pathname = pathname.slice('/api'.length) || '/';
+    if (!pathname.startsWith('/')) pathname = '/' + pathname;
+  }
+
+  // 2) 2026-10-26: /opencode/v1/* 전용 접두사 라우트.
   let isOpencodePrefix = false;
   if (pathname === '/opencode' || pathname.startsWith('/opencode/')) {
     isOpencodePrefix = true;
     pathname = pathname.slice('/opencode'.length) || '/';
-    if (!pathname.startsWith('/')) pathname = '/' + pathname;
-  }
-
-  // Stormkit /api prefix stripping
-  if (pathname === '/api' || pathname.startsWith('/api/')) {
-    pathname = pathname.slice('/api'.length) || '/';
     if (!pathname.startsWith('/')) pathname = '/' + pathname;
   }
 
@@ -2283,7 +2280,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     // P20: /v1/responses passthrough 정규화 — Codex wire_api=responses 직접 호출 시
     // type:'text' 등이 그대로 가면 Zen이 input[N].content 400을 냄. skill.md §4 교훈.
     if (Array.isArray(upstreamBody.input)) upstreamBody.input = sanitizeResponsesInput(upstreamBody.input);
-    if (Array.isArray(upstreamBody.instructions) && typeof upstreamBody.instructions === 'string') {
+    if (typeof upstreamBody.instructions === 'string') {
       // instructions는 문자열 그대로 유지 — 배열이면 이미 input으로 처리됨
     }
     // P36: /v1/responses 네이티브 호출 경로(opencode-free-res provider 등)도 free tier

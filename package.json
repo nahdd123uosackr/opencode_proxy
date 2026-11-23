@@ -10,6 +10,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "ws": "8.21.0"
+    "ws": "8.21.0",
+    "@stormkit/serverless": "^2.7.4"
   }
 }

@@ -1720,6 +1720,12 @@ const handle = async (req, res) => {
     if (!pathname.startsWith('/')) pathname = '/' + pathname;
   }
 
+  // Stormkit /api prefix stripping
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    pathname = pathname.slice('/api'.length) || '/';
+    if (!pathname.startsWith('/')) pathname = '/' + pathname;
+  }
+
   if (pathname === '/' || pathname === '' || pathname === '/health' || pathname === '/v1/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ status: 'ok', upstream: UPSTREAM }));

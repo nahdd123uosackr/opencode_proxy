@@ -325,41 +325,40 @@ const OPENCODE_SESSION_TS_MAX = 0xfffffffffn; // 36-bit timestamp window (OmniRo
 const OPENCODE_SESSION_COUNTER = 1n;
 const SESSION_COUNTER_MAX = 16;
 let zenIdCounter = 0;
-function canonicalSessionId() {
-  // 9router #5218 / OmniRoute PR #19128: 36-bit timestamp within recent UTC day + counter 1
-  const dayMs = 86400000n;
-  const now = BigInt(Date.now());
-  const hashed = BigInt('0x' + crypto.randomBytes(8).toString('hex'));
-  const ts36 = ((now / dayMs) * dayMs - (hashed % dayMs)) & OPENCODE_SESSION_TS_MAX;
-  const inverted = ~((ts36 << 12n) | OPENCODE_SESSION_COUNTER) & ZEN_TS_MASK;
-  const hexPart = inverted.toString(16).padStart(12, '0');
-  const digest = crypto.randomBytes(14);
-  let b62Part = '';
-  for (const byte of digest) b62Part += ZEN_B62[byte % 62];
-  return 'ses_' + hexPart + b62Part;
-}
-const ZEN_SESSION_MODE = process.env.ZEN_SESSION_MODE || 'stable'; // 'stable' | 'random'
-let zenAnonSession = null; // { id: string, day: string }
-const zenKeySessionCache = new Map(); // keyHash -> canonical session id (프로세스 수명 동안 고정)
-function resetZenSession(zenApiKey) {
-  if (zenApiKey) {
-    const keyHash = crypto.createHash('sha256').update(String(zenApiKey)).digest('hex').slice(0, 16);
-    zenKeySessionCache.delete(keyHash);
-  } else {
-    zenAnonSession = null;
+const SESSION_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let sessionClock = { ms: 0, ctr: 0 };
+function canonicalSessionId(now = Date.now()) {
+  if (now !== sessionClock.ms) {
+    sessionClock.ms = now;
+    sessionClock.ctr = 0;
   }
+  sessionClock.ctr++;
+  const stamp = BigInt(now) * 0x1000n + BigInt(sessionClock.ctr);
+  const masked = ~stamp;
+  const hex = Array.from({ length: 6 }, (_, i) => Number((masked >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, "0")).join("");
+  const tail = Array.from(crypto.randomBytes(14), (b) => SESSION_ALPHABET[b % 62]).join("");
+  return "ses_" + hex + tail;
 }
+
+const SESSION_MAX_AGE_MS = 30 * 60_000;
+const ZEN_SESSION_MODE = process.env.ZEN_SESSION_MODE || "stable";
+let zenAnonSession = null; // { id: string, at: number }
+const zenKeySessionCache = new Map();
+
 function sessionIdFor(zenApiKey) {
-  if (ZEN_SESSION_MODE === 'random') return canonicalSessionId();
-  const day = new Date().toISOString().slice(0, 10); // UTC 일 단위
+  const now = Date.now();
+  if (ZEN_SESSION_MODE === "random") return canonicalSessionId(now);
   if (zenApiKey) {
-    const keyHash = crypto.createHash('sha256').update(String(zenApiKey)).digest('hex').slice(0, 16);
-    let id = zenKeySessionCache.get(keyHash);
-    if (!id) { id = canonicalSessionId(); zenKeySessionCache.set(keyHash, id); }
-    return id;
+    const keyHash = crypto.createHash("sha256").update(String(zenApiKey)).digest("hex").slice(0, 16);
+    let entry = zenKeySessionCache.get(keyHash);
+    if (!entry || (now - entry.at > SESSION_MAX_AGE_MS)) {
+      entry = { id: canonicalSessionId(now), at: now };
+      zenKeySessionCache.set(keyHash, entry);
+    }
+    return entry.id;
   }
-  if (!zenAnonSession || zenAnonSession.day !== day) {
-    zenAnonSession = { id: canonicalSessionId(), day };
+  if (!zenAnonSession || (now - zenAnonSession.at > SESSION_MAX_AGE_MS)) {
+    zenAnonSession = { id: canonicalSessionId(now), at: now };
   }
   return zenAnonSession.id;
 }
@@ -594,50 +593,84 @@ async function isZenFreeTierModel(modelId) {
 // tools를 종류와 무관하게 전부 보존한 채 CLI 플레이스홀더와 합집합을 항상 만든다.
 const ZEN_MIN_TOOLS = 6;
 function applyZenFreeTierContract(body, requestFormat) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
 
-  // OmniRoute PR #19128 (2026-11): Canonical OpenCode CLI prompt & full tools set injection
-  if (opencodeCanonical && Array.isArray(body.messages) && (requestFormat === 'chat' || !requestFormat)) {
-    const canonicalPrompt = opencodeCanonical.canonicalOpencodeSystemPrompt(body.model);
-    const first = body.messages[0];
-    const already = first && first.role === 'system' && first.content === canonicalPrompt;
-    const messages = already
-      ? body.messages
-      : [{ role: 'system', content: canonicalPrompt }, ...body.messages];
+  const isChat = requestFormat === "chat" || !requestFormat;
+  const isResponses = requestFormat === "responses";
 
-    const existingTools = Array.isArray(body.tools) ? body.tools : [];
-    const clientToolNames = new Set(
-      existingTools.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean)
-    );
-    const missingTools = opencodeCanonical.OPENCODE_CLI_TOOLS.filter(
-      (tool) => !clientToolNames.has(tool.function.name)
-    );
-    const tools = [...existingTools, ...missingTools];
+  if (opencodeCanonical) {
+    let next = { ...body, stream: true };
 
-    const result = {
-      ...body,
-      stream: true,
-      messages,
-      tools
-    };
-    // 주입 도구 이름은 로컬 후처리용 메타데이터 — JSON.stringify/스프레드로 업스트림에
-    // 새지 않도록 non-enumerable로 붙인다 (enumerable이면 upstream이 400을 반환).
-    Object.defineProperty(result, '_injectedToolNames', {
-      value: missingTools.map((tool) => tool.function.name),
+    // 1) OpenCode 하네스 프리앰블 주입 (403/429 FreeTierError 방어)
+    if (Array.isArray(next.messages) && isChat) {
+      next.messages = opencodeCanonical.injectPreamble
+        ? opencodeCanonical.injectPreamble(next.messages)
+        : [{ role: "system", content: opencodeCanonical.canonicalOpencodeSystemPrompt(next.model) }, ...next.messages];
+    } else if (isResponses && opencodeCanonical.combinePreamble) {
+      next.instructions = opencodeCanonical.combinePreamble(typeof next.instructions === "string" ? next.instructions : "");
+    }
+
+    // 2) 실제 OpenCode 도구 매니페스트 주입 + tool_choice: "none" 제어
+    const canonicalTools = opencodeCanonical.OPENCODE_CLI_TOOLS || [];
+    const existingTools = Array.isArray(next.tools) ? next.tools : [];
+    const clientHasTools = existingTools.length > 0;
+
+    let finalTools;
+    let injectedNames = [];
+    let stripAllTools = false;
+
+    if (!clientHasTools) {
+      // 일반 대화/도구 미제공 요청:
+      // Zen 게이트는 도구 매니페스트가 필수이므로 주입하되,
+      // 모델이 가상 도구를 호출하지 않도록 tool_choice: "none" 강제
+      finalTools = [...canonicalTools];
+      injectedNames = canonicalTools.map((t) => t?.function?.name || t?.name || "").filter(Boolean);
+      stripAllTools = true;
+
+      if (isResponses) {
+        delete next.tool_choice;
+      } else {
+        next.tool_choice = "none";
+      }
+    } else {
+      // 호출자가 자체 도구를 제공한 경우:
+      const clientToolNames = new Set(
+        existingTools.map((t) => t?.function?.name || t?.name || "").filter(Boolean)
+      );
+      const missingTools = canonicalTools.filter(
+        (tool) => !clientToolNames.has(tool?.function?.name || tool?.name)
+      );
+      finalTools = [...existingTools, ...missingTools];
+      injectedNames = missingTools.map((t) => t?.function?.name || t?.name || "").filter(Boolean);
+      stripAllTools = false;
+
+      if (isResponses && next.tool_choice === "none") {
+        delete next.tool_choice;
+      }
+    }
+
+    next.tools = finalTools;
+
+    Object.defineProperty(next, "_injectedToolNames", {
+      value: injectedNames,
       enumerable: false,
       configurable: true,
       writable: true,
     });
-    if (result.tool_choice === 'none') {
-      delete result.tool_choice;
-    }
-    return result;
+    Object.defineProperty(next, "_stripAllTools", {
+      value: stripAllTools,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+
+    return next;
   }
 
   let next = applyFingerprintSystemPrompt({ ...body, stream: true });
   let existing = Array.isArray(next.tools) ? next.tools : [];
-  existing = existing.filter((t) => t && t.type !== 'image_generation');
-  const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || '').filter(Boolean));
+  existing = existing.filter((t) => t && t.type !== "image_generation");
+  const existingNames = new Set(existing.map((t) => (t && t.function && t.function.name) || (t && t.name) || "").filter(Boolean));
   const placeholders = zenPlaceholderToolsFor(requestFormat).filter((t) => {
     const name = (t.function && t.function.name) || t.name;
     return !existingNames.has(name);
@@ -1267,6 +1300,116 @@ function rebuildChatJsonFromForcedStream(sseText, model, injectedNames) {
     usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
 }
+
+// zen-proxy 체리픽: WHATWG reader.read() 기반 실시간 청크 스트리밍 + 클라이언트 연결 종료 시 Abort
+async function relayChatStream(req, res, upstreamRes, requestedModel, stripAllTools, injectedNames) {
+  res.writeHead(200, {
+    "Content-Type": upstreamRes.headers.get("content-type") || "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  if (res.flushHeaders) res.flushHeaders();
+
+  const reader = upstreamRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let closed = false;
+
+  const cancelReader = () => {
+    if (closed) return;
+    closed = true;
+    try { reader.cancel().catch(() => {}); } catch {}
+  };
+
+  req.on?.("close", () => { if (!res.writableEnded) cancelReader(); });
+  res.on?.("close", () => { if (!res.writableEnded) cancelReader(); });
+
+  const injectedSet = injectedNames && injectedNames.length ? new Set(injectedNames) : null;
+  const nameByIndex = new Map();
+
+  const processBlock = (block) => {
+    if (!block.trim()) return;
+    const lines = block.split("\n");
+    const out = [];
+
+    for (const line of lines) {
+      if (line.startsWith("data:")) {
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") {
+          out.push("data: [DONE]");
+          continue;
+        }
+        if (!payload) continue;
+        try {
+          const parsed = JSON.parse(payload);
+          if (parsed && typeof parsed === "object") {
+            if (requestedModel && "model" in parsed) parsed.model = requestedModel;
+
+            if (stripAllTools) {
+              for (const choice of parsed.choices || []) {
+                const b = choice.delta || choice.message;
+                if (b && b.tool_calls) delete b.tool_calls;
+                if (choice.finish_reason === "tool_calls") choice.finish_reason = "stop";
+              }
+            } else if (injectedSet && parsed.choices) {
+              for (const choice of parsed.choices) {
+                const delta = choice.delta || choice.message;
+                if (delta && Array.isArray(delta.tool_calls)) {
+                  delta.tool_calls = delta.tool_calls.filter((tc) => {
+                    const idx = typeof tc.index === "number" ? tc.index : 0;
+                    if (tc.function?.name) nameByIndex.set(idx, tc.function.name);
+                    const callName = nameByIndex.get(idx) || tc.function?.name;
+                    return !callName || !injectedSet.has(callName);
+                  });
+                  if (delta.tool_calls.length === 0) delete delta.tool_calls;
+                }
+                if (choice.finish_reason === "tool_calls" && (!delta || !delta.tool_calls)) {
+                  choice.finish_reason = "stop";
+                }
+              }
+            }
+          }
+          out.push(`data: ${JSON.stringify(parsed)}`);
+        } catch {
+          out.push(line);
+        }
+      } else {
+        out.push(line);
+      }
+    }
+
+    if (out.length > 0 && !res.writableEnded) {
+      res.write(out.join("\n") + "\n\n");
+    }
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        processBlock(block);
+      }
+    }
+    if (buffer.trim()) {
+      processBlock(buffer);
+    }
+  } catch (err) {
+    if (!closed && !res.writableEnded) {
+      console.error("[relayChatStream error]", err.message);
+    }
+  } finally {
+    cancelReader();
+    if (!res.writableEnded) {
+      res.end();
+    }
+  }
+}
+
 
 // P33: museViaResponses가 free tier 계약 때문에 body.stream을 강제로 true로 보내면
 // (클라이언트가 stream:false를 원했어도) upstream이 Responses API SSE로 답한다 —
@@ -2055,7 +2198,30 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
           return res.end(JSON.stringify(cj));
         }
       } else {
-        fetchRes = await fetch(targetChatUrl, { method: 'POST', headers: headers, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
+        const fetchAbortCtrl = new AbortController();
+        const onReqClose = () => { if (!res.writableEnded) fetchAbortCtrl.abort(); };
+        req.on?.("close", onReqClose);
+        res.on?.("close", onReqClose);
+
+        fetchRes = await fetch(targetChatUrl, {
+          method: "POST",
+          headers: headers,
+          body: JSON.stringify(upstreamBody),
+          signal: fetchAbortCtrl.signal
+        });
+
+        // 실시간 스트리밍: 200 OK 및 body.stream인 경우 일괄 버퍼링 없이 즉시 파이프라인 릴레이
+        if (fetchRes.ok && body.stream) {
+          if (zenApiKey) markKeySuccess(zenApiKey);
+          return await relayChatStream(
+            req,
+            res,
+            fetchRes,
+            upstreamModel,
+            !!upstreamBody._stripAllTools,
+            upstreamBody._injectedToolNames || []
+          );
+        }
       }
       let bodyText = await fetchRes.text();
 
@@ -2553,8 +2719,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
       const injected = (patched && patched._injectedToolNames) || [];
       if (isStream && fr.body && ct.includes('text/event-stream')) {
         if (injected.length > 0) {
-          const rawText = await fr.text();
-          return res.end(filterInjectedSSEText(rawText, injected));
+          return await relayChatStream(req, res, fr, reqModel, !!(patched && patched._stripAllTools), injected);
         }
         for await (const chunk of fr.body) res.write(chunk);
         return res.end();

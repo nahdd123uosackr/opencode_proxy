@@ -2097,7 +2097,7 @@ const handle = async (req, res) => {
     }
 
     // --- 2 & 3. OpenCode Zen 요청 처리 (Zen Key 또는 무료 익명 풀) ---
-    const zenApiKey = isZen ? clientKey : null;
+    const zenApiKey = (isZen && clientKey) ? clientKey : (process.env.OPENCODE_API_KEY || null);
     const { upstreamModel, variant } = parseModel(body.model);
 
     if (Array.isArray(body.input) && !Array.isArray(body.messages)) {
@@ -2292,7 +2292,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     applyMinTokens(body);
     if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'model required' } })); }
     
-    const zenApiKey = isZen ? clientKey : null;
+    const zenApiKey = (isZen && clientKey) ? clientKey : (process.env.OPENCODE_API_KEY || null);
     const { upstreamModel, variant } = parseModel(body.model);
     // P23: 콜론 접미사가 없으면 Claude의 thinking(budget_tokens) -> 그다음
     // reasoning_effort/reasoning.effort 순서로 effort를 추정한다. 이전에는 콜론
@@ -2421,7 +2421,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     applyMinTokens(body);
     if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
     
-    const zenApiKey = isZen ? clientKey : null;
+    const zenApiKey = (isZen && clientKey) ? clientKey : (process.env.OPENCODE_API_KEY || null);
     const { upstreamModel, variant } = parseModel(body.model);
     // P23: 네이티브 /v1/responses 호출은 보통 body.reasoning.effort를 이미 제대로
     // 보내서(applyMuseDefaults의 `body.reasoning || {...}`가 보존) 대부분 문제없지만,
@@ -2492,7 +2492,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
   // 아래 6개 라우트는 바디를 전혀 건드리지 않는 순수 passthrough다 — 변환 버그
   // (P3/P9/P14/P20/P21/P23) 계열 자체가 구조적으로 발생할 수 없다.
   if (pathname === '/res/v1/models' || pathname === '/chat/v1/models' || pathname === '/mes/v1/models') {
-    const zenApiKey = isZen ? clientKey : null;
+    const zenApiKey = (isZen && clientKey) ? clientKey : (process.env.OPENCODE_API_KEY || null);
     const headers = injectHeaders({ 'Content-Type': 'application/json' }, null, zenApiKey);
     try {
       const fr = await fetch(UPSTREAM + '/models', { method: 'GET', headers, signal: AbortSignal.timeout(ZEN_TIMEOUT_MS) });
@@ -2552,7 +2552,7 @@ let upstreamBody = applyVariant(applyMuseDefaults({ ...body, model: upstreamMode
     const rawBody = Buffer.concat(chunks).toString('utf-8');
     let body; try { body = JSON.parse(rawBody || '{}'); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'Invalid JSON' } })); }
     if (!body.model) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: { message: 'model required' } })); }
-    const zenApiKey = isZen ? clientKey : null;
+    const zenApiKey = (isZen && clientKey) ? clientKey : (process.env.OPENCODE_API_KEY || null);
     const isStream = !!body.stream;
     const headers = injectHeaders({ 'Content-Type': 'application/json', 'Accept': isStream ? 'text/event-stream' : 'application/json' }, null, zenApiKey, body);
     // zen의 /v1/messages는 진짜 Anthropic Messages API 계약을 따라서 Authorization: Bearer가

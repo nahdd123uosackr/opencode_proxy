@@ -1,4 +1,5 @@
 #!/bin/bash
+export KUBECONFIG="${KUBECONFIG:-/home/debian/.kube/config}"
 # =============================================================================
 # opencode_proxy 전체 함대 재배포 스크립트
 # =============================================================================
@@ -37,9 +38,9 @@
 
 set -uo pipefail
 
-VERCEL=/root/.npm-global/bin/vercel
-DENO=/root/.deno/bin/deno
-REPO=/root/llm_proxy/opencode_proxy
+VERCEL="${VERCEL:-$(which vercel 2>/dev/null || echo /usr/local/bin/vercel)}"
+DENO="${DENO:-$(which deno 2>/dev/null || echo /usr/local/bin/deno)}"
+REPO=/share/git/oracle2-llm-proxy/opencode_proxy
 SRC_VERCEL="$REPO/vercel"
 SRC_LOCAL="$REPO/api/index.js"
 # convex 프로젝트 원본: 이 저장소의 opencode_proxy/convex/ (opencode_proxy 사본이 없으면
@@ -53,54 +54,80 @@ RESULTS="/tmp/redeploy-results-$(date +%Y%m%d-%H%M%S).txt"
 mkdir -p "$WORKDIR"
 : > "$RESULTS"
 
-# --- 자격증명 로딩 ---
-# 모든 배포 키는 /share/opencode_proxy_key.txt 한 곳에서 읽는다(저장소에 시크릿 금지).
-# 파일 포맷:
-#   VERCEL_TOKENS
-#       [acct]="vcp_..."
-#   DENO_TOKENS
-#       [org]="ddo_..."
-#   CONVEX_TOKENS
-#       prod:<name>|<deploy-key>
-KEY_FILE="${OPENCODE_PROXY_KEY_FILE:-/share/opencode_proxy_key.txt}"
-if [ ! -r "$KEY_FILE" ]; then
-  echo "FATAL: 자격증명 파일 없음: $KEY_FILE" >&2
-  exit 1
-fi
-
+# --- 자격증명 로딩 (AWS SSM Parameter Store 우선, 로컬 파일 폴백) ---
 declare -A VERCEL_TOKENS=()
 declare -A DENO_TOKENS=()
 CONVEX_CR_FILE="$WORKDIR/convex_cr.txt"
 : > "$CONVEX_CR_FILE"
 
-_section=""
-while IFS= read -r _line || [ -n "$_line" ]; do
-  _line="${_line%$'\r'}"
-  case "$_line" in
-    ''|'#'*) continue ;;
-    VERCEL_TOKENS|DENO_TOKENS|CONVEX_TOKENS) _section="$_line"; continue ;;
-  esac
-  case "$_section" in
-    VERCEL_TOKENS)
-      if [[ "$_line" =~ ^[[:space:]]*\[([^]]+)\]=\"([^\"]*)\" ]]; then
-        VERCEL_TOKENS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
-      fi
-      ;;
-    DENO_TOKENS)
-      if [[ "$_line" =~ ^[[:space:]]*\[([^]]+)\]=\"([^\"]*)\" ]]; then
-        DENO_TOKENS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
-      fi
-      ;;
-    CONVEX_TOKENS)
-      if [[ "$_line" =~ ^[[:space:]]*(prod:.+\|.+)$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}" >> "$CONVEX_CR_FILE"
-      fi
-      ;;
-  esac
-done < "$KEY_FILE"
+LOAD_FROM_SSM=false
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import boto3' 2>/dev/null; then
+  eval "$(python3 -c "
+import subprocess, json, base64, boto3, sys
+try:
+    try:
+        p = subprocess.run(['kubectl', 'get', 'secret', 'aws-creds', '-n', 'default', '-o', 'json'], capture_output=True, text=True, check=True)
+    except Exception:
+        p = subprocess.run(['sudo', 'kubectl', 'get', 'secret', 'aws-creds', '-n', 'default', '-o', 'json'], capture_output=True, text=True, check=True)
+    sec = json.loads(p.stdout)['data']
+    ak = base64.b64decode(sec['access-key']).decode().strip()
+    sk = base64.b64decode(sec['secret-access-key']).decode().strip()
+    ssm = boto3.client('ssm', region_name='ap-southeast-2', aws_access_key_id=ak, aws_secret_access_key=sk)
+    paginator = ssm.get_paginator('get_parameters_by_path')
+    pages = paginator.paginate(Path='/opencode/deploy-keys/', Recursive=True, WithDecryption=True)
+    cmds = ['LOAD_FROM_SSM=true']
+    for page in pages:
+        for param in page.get('Parameters', []):
+            name = param['Name']
+            val = param['Value']
+            if name.startswith('/opencode/deploy-keys/vercel/'):
+                acct = name.split('/')[-1]
+                cmds.append(f'VERCEL_TOKENS[\"{acct}\"]=\"{val}\"')
+            elif name.startswith('/opencode/deploy-keys/deno/'):
+                org = name.split('/')[-1]
+                cmds.append(f'DENO_TOKENS[\"{org}\"]=\"{val}\"')
+            elif name.startswith('/opencode/deploy-keys/convex/'):
+                cmds.append(f'echo \"{val}\" >> \"$CONVEX_CR_FILE\"')
+    print('\n'.join(cmds))
+except Exception as e:
+    print(f'# SSM 로드 실패: {e}', file=sys.stderr)
+" 2>/dev/null)"
+fi
+
+if [ "$LOAD_FROM_SSM" != "true" ] || [ ${#VERCEL_TOKENS[@]} -eq 0 ]; then
+  KEY_FILE="${OPENCODE_PROXY_KEY_FILE:-/share/opencode_proxy_key.txt}"
+  if [ -r "$KEY_FILE" ]; then
+    echo "[info] AWS SSM 대신 로컬 자격증명 파일($KEY_FILE)에서 로드합니다."
+    _section=""
+    while IFS= read -r _line || [ -n "$_line" ]; do
+      _line="${_line%$'\r'}"
+      case "$_line" in
+        ''|'#'*) continue ;;
+        VERCEL_TOKENS|DENO_TOKENS|CONVEX_TOKENS) _section="$_line"; continue ;;
+      esac
+      case "$_section" in
+        VERCEL_TOKENS)
+          if [[ "$_line" =~ ^[[:space:]]*\[([^]]+)\]=\"([^\"]*)\" ]]; then
+            VERCEL_TOKENS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+          fi
+          ;;
+        DENO_TOKENS)
+          if [[ "$_line" =~ ^[[:space:]]*\[([^]]+)\]=\"([^\"]*)\" ]]; then
+            DENO_TOKENS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+          fi
+          ;;
+        CONVEX_TOKENS)
+          if [[ "$_line" =~ ^[[:space:]]*(prod:.+\|.+)$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}" >> "$CONVEX_CR_FILE"
+          fi
+          ;;
+      esac
+    done < "$KEY_FILE"
+  fi
+fi
 
 if [ ${#VERCEL_TOKENS[@]} -eq 0 ]; then
-  echo "FATAL: $KEY_FILE 에서 VERCEL_TOKENS 를 읽지 못했습니다" >&2
+  echo "FATAL: VERCEL_TOKENS를 SSM 또는 로컬 파일에서 읽지 못했습니다" >&2
   exit 1
 fi
 
@@ -160,9 +187,40 @@ deploy_vercel() {
 
 deploy_deno() {
   local org="$1"
-  local token="${DENO_TOKENS[$org]}"
-  ( cd "$REPO/deno" && "$DENO" deploy --token="$token" --org="$org" --app=opencode-proxy --prod --json --non-interactive \
+  local token="${DENO_TOKENS[$org]:-}"
+  if [ -z "$token" ]; then
+    echo "deno|${org}|-|FAIL (토큰 없음)" >> "$RESULTS"
+    return
+  fi
+  local api_key=""
+  if command -v python3 >/dev/null 2>&1; then
+    api_key=$(python3 -c "
+import subprocess, json, base64, boto3
+try:
+    try:
+        p = subprocess.run(['kubectl', 'get', 'secret', 'aws-creds', '-n', 'default', '-o', 'json'], capture_output=True, text=True, check=True)
+    except Exception:
+        p = subprocess.run(['sudo', 'kubectl', 'get', 'secret', 'aws-creds', '-n', 'default', '-o', 'json'], capture_output=True, text=True, check=True)
+    sec = json.loads(p.stdout)['data']
+    ak = base64.b64decode(sec['access-key']).decode().strip()
+    sk = base64.b64decode(sec['secret-access-key']).decode().strip()
+    ssm = boto3.client('ssm', region_name='ap-southeast-2', aws_access_key_id=ak, aws_secret_access_key=sk)
+    print(ssm.get_parameter(Name='/opencode/api-keys/deno/$org', WithDecryption=True)['Parameter']['Value'])
+except Exception:
+    pass
+" 2>/dev/null)
+  fi
+
+  local td="$WORKDIR/deno-${org}"
+  rm -rf "$td" && cp -r "$REPO/deno" "$td"
+  if [ -n "$api_key" ]; then
+    sed -i "s|let STATIC_OPENCODE_API_KEY = \"\";|let STATIC_OPENCODE_API_KEY = \"$api_key\";|" "$td/main.ts"
+  fi
+
+  ( cd "$td" && "$DENO" deploy --token="$token" --org="$org" --app=opencode-proxy --prod --json --non-interactive \
       > "$WORKDIR/deno-${org}.json" 2>&1 )
+  rm -rf "$td"
+
   local url="https://opencode-proxy.${org}.deno.net"
   local hs
   hs=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$url/v1/models" 2>/dev/null)
@@ -173,16 +231,19 @@ deploy_deno() {
 deploy_local() {
   local host="$1"   # oracle1 | oracle2
   local remote_path=/opt/opencode-proxy/api/index.js
+  local remote_canon=/opt/opencode-proxy/api/opencodeCanonical.js
   local svc=opencode-proxy
 
-  ( cd "$REPO/utls_bridge" && go build -o utls_bridge . )
+  [ -x "\/usr/bin/go" ] && ( cd "$REPO/utls_bridge" && go build -o utls_bridge . ) || true
 
   if [ "$host" = "oracle2" ]; then
-    cp "$remote_path" "${remote_path}.bak-$(date +%Y%m%d-%H%M%S)-pre-redeploy" >/dev/null 2>&1
+    cp "$remote_path" "${remote_path}.bak-61123-164727-pre-redeploy" >/dev/null 2>&1
     {
       node --check "$SRC_LOCAL" \
+        && node --check "$REPO/api/opencodeCanonical.js" \
         && node --check "$REPO/server.js" \
         && cp "$SRC_LOCAL" "$remote_path" \
+        && cp "$REPO/api/opencodeCanonical.js" "$remote_canon" \
         && cp "$REPO/server.js" /opt/opencode-proxy/server.js \
         && cp "$REPO/utls_bridge/utls_bridge" /opt/opencode-proxy/utls_bridge \
         && chmod +x /opt/opencode-proxy/utls_bridge \
@@ -191,11 +252,14 @@ deploy_local() {
         && systemctl is-active "$svc"
     } > "$WORKDIR/local-${host}.log" 2>&1
   else
-    ssh -o ConnectTimeout=8 oracle1 "cp $remote_path ${remote_path}.bak-\$(date +%Y%m%d-%H%M%S)-pre-redeploy" >/dev/null 2>&1
-    scp -o ConnectTimeout=8 "$SRC_LOCAL" "oracle1:/tmp/index.check.js" >/dev/null 2>&1
-    scp -o ConnectTimeout=8 "$REPO/server.js" "oracle1:/opt/opencode-proxy/server.js" >/dev/null 2>&1
-    scp -o ConnectTimeout=8 "$REPO/utls_bridge/utls_bridge" "oracle1:/opt/opencode-proxy/utls_bridge" >/dev/null 2>&1
-    ssh -o ConnectTimeout=8 oracle1 "chmod +x /opt/opencode-proxy/utls_bridge && node --check /tmp/index.check.js && cp /tmp/index.check.js $remote_path && systemctl restart $svc && sleep 2 && systemctl is-active $svc" \
+    local SSH_CMD="ssh -F /dev/null -i /home/debian/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=8 debian@192.168.200.1"
+    local SCP_CMD="scp -F /dev/null -i /home/debian/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=8"
+    \$SSH_CMD "sudo cp $remote_path ${remote_path}.bak-\61123-164727-pre-redeploy" >/dev/null 2>&1
+    \$SCP_CMD "$SRC_LOCAL" "debian@192.168.200.1:/tmp/index.check.js" >/dev/null 2>&1
+    \$SCP_CMD "$REPO/api/opencodeCanonical.js" "debian@192.168.200.1:/tmp/opencodeCanonical.js" >/dev/null 2>&1
+    \$SCP_CMD "$REPO/server.js" "debian@192.168.200.1:/tmp/server.js" >/dev/null 2>&1
+    \$SCP_CMD "$REPO/utls_bridge/utls_bridge" "debian@192.168.200.1:/tmp/utls_bridge" >/dev/null 2>&1
+    \$SSH_CMD "node --check /tmp/index.check.js && node --check /tmp/opencodeCanonical.js && sudo cp /tmp/index.check.js $remote_path && sudo cp /tmp/opencodeCanonical.js $remote_canon && sudo cp /tmp/server.js /opt/opencode-proxy/server.js && sudo cp /tmp/utls_bridge /opt/opencode-proxy/utls_bridge && sudo chmod +x /opt/opencode-proxy/utls_bridge && sudo systemctl restart $svc && sleep 2 && sudo systemctl is-active $svc" \
       > "$WORKDIR/local-${host}.log" 2>&1
   fi
 
@@ -265,10 +329,13 @@ deploy_convex() {
 
 PIDS=()
 
-# Vercel 배포: v1만 배포 (v2, v3, v4는 전면 폐기)
+# Vercel 배포: v1 및 v2 배포
 for acct in "${V1V2_ACCOUNTS[@]}"; do
   if want_group_for_account "$acct" v1; then
     deploy_vercel "$acct" vercel-opencode-proxy v1 & PIDS+=("$!")
+  fi
+  if want_group_for_account "$acct" v2; then
+    deploy_vercel "$acct" vercel-opencode-proxy-v2 v2 & PIDS+=("$!")
   fi
 done
 

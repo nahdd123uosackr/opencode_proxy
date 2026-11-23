@@ -9,8 +9,9 @@ const ENV: Record<string, string | undefined> = (() => {
   const proc = (globalThis as any).process;
   return proc && proc.env ? { ...proc.env } : {};
 })();
+let STATIC_OPENCODE_API_KEY = "";
 function envGet(key: string): string | undefined {
-  return ENV[key];
+  return ENV[key] || (key === 'OPENCODE_API_KEY' ? (STATIC_OPENCODE_API_KEY || undefined) : undefined);
 }
 function envPrime(extra: unknown): void {
   if (extra && typeof extra === 'object') Object.assign(ENV, extra);
@@ -225,6 +226,10 @@ async function injectHeaders(headers: any, upstreamBody?: any) {
   h['Connection'] = 'close';
   if (upstreamBody && typeof upstreamBody === 'object' && !upstreamBody.prompt_cache_key) {
     upstreamBody.prompt_cache_key = sessionId;
+  }
+  const apiKey = envGet('OPENCODE_API_KEY');
+  if (!h['Authorization'] && apiKey) {
+    h['Authorization'] = apiKey.startsWith('Bearer ') ? apiKey : 'Bearer ' + apiKey;
   }
   return h;
 }

@@ -1753,11 +1753,13 @@ const handle = async (req, res) => {
   const chunks = []; let bodyBytes = 0;
   await new Promise(resolve => {
     req.on('data', c => {
-      bodyBytes += c.length;
+      if (!c) return;
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      bodyBytes += buf.length;
       if (bodyBytes > MAX_BODY_BYTES) { for (const [k,v] of Object.entries(corsHeaders())) res.setHeader(k,v); res.writeHead(413, {'Content-Type':'application/json'}); res.end(JSON.stringify({ error: 'payload too large' })); req.destroy(); resolve(); return; }
-      chunks.push(c);
+      chunks.push(buf);
     });
-    req.on('end', () => { const rawBody = Buffer.concat(chunks).toString('utf-8'); resolve(); });
+    req.on('end', () => resolve());
     req.on('error', () => resolve());
   });
 
